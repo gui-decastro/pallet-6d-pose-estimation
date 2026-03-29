@@ -1,0 +1,5 @@
+# CMake build output
+camera_capture/d400e_cpp/build/
+
+# Collected camera data
+camera_capture/collected_data/*
