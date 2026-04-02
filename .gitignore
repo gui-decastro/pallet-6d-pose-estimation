@@ -1,6 +1,11 @@
 # CMake build output
 camera_capture/d400e_cpp/build/
 
+# Colcon workspace artifacts (ROS2) - Trajectory Vizualiation
+trajectory_viz/build/
+trajectory_viz/install/
+trajectory_viz/log/
+
 # Collected camera data
 camera_capture/collected_data/*
 !camera_capture/collected_data/.gitkeep
