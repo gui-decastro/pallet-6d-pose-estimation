@@ -9,3 +9,11 @@ trajectory_viz/log/
 # Collected camera data
 camera_capture/collected_data/*
 !camera_capture/collected_data/.gitkeep
+
+# Meshes
+trajectory_viz/meshes/*.FCStd
+trajectory_viz/meshes/*.FCBak
+trajectory_viz/meshes/archive/
+trajectory_viz/meshes/*.stl
+!trajectory_viz/meshes/forklift.stl
+!trajectory_viz/meshes/pallet.stl
