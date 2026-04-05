@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, TransformStamped
+from std_msgs.msg import Empty
 from nav_msgs.msg import Path
 from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import TransformBroadcaster
@@ -25,40 +26,204 @@ def _angle_diff(a, b):
 def plan_diff_drive_path(x0, y0, th0, x1, y1, th1,
                          step=0.15, rot_step_deg=5.0):
     """
-    Plan a 3-segment path for a differential-drive robot and return
-    a list of (x, y, theta) world-frame waypoints.
+    3-segment differential-drive path with automatic forward/reverse selection.
+    Chooses whichever direction (forward or reverse) requires less total rotation,
+    producing the shortest overall path.
 
-    step         — straight-line sample spacing (metres)
-    rot_step_deg — heading sample spacing during in-place rotations (degrees)
+      rotate in place → drive forward or reverse → rotate in place
     """
-    points = []
     rot_step = math.radians(rot_step_deg)
 
     dx, dy = x1 - x0, y1 - y0
     dist = math.hypot(dx, dy)
     th_travel = math.atan2(dy, dx)
+    th_reverse = math.atan2(-dy, -dx)
+
+    # Total rotation cost for forward vs reverse
+    fwd_rot = abs(_angle_diff(th_travel, th0)) + abs(_angle_diff(th1, th_travel))
+    rev_rot = abs(_angle_diff(th_reverse, th0)) + abs(_angle_diff(th1, th_reverse))
+    reverse = rev_rot < fwd_rot
+    th_drive = th_reverse if reverse else th_travel
+
+    points = []
 
     # ---- Segment 1: rotate in place at (x0, y0) ----------------------
-    delta1 = _angle_diff(th_travel, th0)
+    delta1 = _angle_diff(th_drive, th0)
     n1 = max(2, int(abs(delta1) / rot_step))
     for i in range(n1):
-        th = th0 + (i / n1) * delta1
-        points.append((x0, y0, th))
+        points.append((x0, y0, th0 + (i / n1) * delta1))
 
-    # ---- Segment 2: drive straight to (x1, y1) -----------------------
+    # ---- Segment 2: drive to (x1, y1) --------------------------------
     n2 = max(2, int(dist / step))
     for i in range(n2):
         frac = i / n2
-        points.append((x0 + frac * dx, y0 + frac * dy, th_travel))
+        points.append((x0 + frac * dx, y0 + frac * dy, th_drive))
 
     # ---- Segment 3: rotate in place at (x1, y1) ----------------------
-    delta3 = _angle_diff(th1, th_travel)
+    delta3 = _angle_diff(th1, th_drive)
     n3 = max(2, int(abs(delta3) / rot_step))
     for i in range(n3 + 1):
-        th = th_travel + (i / n3) * delta3 if n3 > 0 else th1
+        th = th_drive + (i / n3) * delta3 if n3 > 0 else th1
         points.append((x1, y1, th))
 
     return points
+
+
+# ======================================================================
+#  Dubins path planner (car-like, constant minimum turn radius)
+#
+#  Geometry conventions:
+#    Right circle center: c_R = (x + r·sin(th), y − r·cos(th))
+#    Left  circle center: c_L = (x − r·sin(th), y + r·cos(th))
+#    Right circle position: p = c_R + r·(−sin(th),  cos(th))
+#    Left  circle position: p = c_L + r·( sin(th), −cos(th))
+#
+#  Four path types (arc-straight-arc):
+#    RSR — same-side external tangent, both arcs CW
+#    LSL — same-side external tangent, both arcs CCW
+#    RSL — cross tangent, first CW then CCW
+#    LSR — cross tangent, first CCW then CW
+# ======================================================================
+
+def _mod2pi(x):
+    return x % (2.0 * math.pi)
+
+
+def _sample_right_arc(cx, cy, r, th_start, th_end, step):
+    """Sample a CW arc on a right circle. Always travels CW (th decreasing)."""
+    travel = _mod2pi(th_start - th_end)
+    n = max(2, int(travel * r / step))
+    pts = []
+    for i in range(n):
+        th = th_start - (i / n) * travel
+        pts.append((cx - r * math.sin(th), cy + r * math.cos(th), th))
+    return pts
+
+
+def _sample_left_arc(cx, cy, r, th_start, th_end, step):
+    """Sample a CCW arc on a left circle. Always travels CCW (th increasing)."""
+    travel = _mod2pi(th_end - th_start)
+    n = max(2, int(travel * r / step))
+    pts = []
+    for i in range(n):
+        th = th_start + (i / n) * travel
+        pts.append((cx + r * math.sin(th), cy - r * math.cos(th), th))
+    return pts
+
+
+def _sample_straight(x0, y0, x1, y1, th, step):
+    dist = math.hypot(x1 - x0, y1 - y0)
+    n = max(2, int(dist / step))
+    return [(x0 + (i / n) * (x1 - x0), y0 + (i / n) * (y1 - y0), th)
+            for i in range(n)]
+
+
+def plan_dubins_path(x0, y0, th0, x1, y1, th1,
+                     min_radius=3.0, step=0.15):
+    """
+    Plan a Dubins path for a car-like vehicle and return
+    a list of (x, y, theta) world-frame waypoints.
+
+    min_radius — minimum turning radius (metres)
+    step       — sample spacing along the path (metres)
+    """
+    r = min_radius
+
+    # Circle centres
+    cR0 = (x0 + r * math.sin(th0), y0 - r * math.cos(th0))
+    cL0 = (x0 - r * math.sin(th0), y0 + r * math.cos(th0))
+    cR1 = (x1 + r * math.sin(th1), y1 - r * math.cos(th1))
+    cL1 = (x1 - r * math.sin(th1), y1 + r * math.cos(th1))
+
+    best_len = math.inf
+    best = None
+
+    # --- RSR ---
+    dx, dy = cR1[0] - cR0[0], cR1[1] - cR0[1]
+    D = math.hypot(dx, dy)
+    if D > 1e-6:
+        th_t = math.atan2(dy, dx)
+        a0 = _mod2pi(th0 - th_t) * r
+        a1 = _mod2pi(th_t - th1) * r
+        total = a0 + D + a1
+        if total < best_len:
+            best_len = total
+            best = ('RSR', cR0, th_t, cR1, th_t)
+
+    # --- LSL ---
+    dx, dy = cL1[0] - cL0[0], cL1[1] - cL0[1]
+    D = math.hypot(dx, dy)
+    if D > 1e-6:
+        th_t = math.atan2(dy, dx)
+        a0 = _mod2pi(th_t - th0) * r
+        a1 = _mod2pi(th1 - th_t) * r
+        total = a0 + D + a1
+        if total < best_len:
+            best_len = total
+            best = ('LSL', cL0, th_t, cL1, th_t)
+
+    # --- RSL ---
+    dx, dy = cL1[0] - cR0[0], cL1[1] - cR0[1]
+    D = math.hypot(dx, dy)
+    if D >= 2 * r:
+        th_c = math.atan2(dy, dx)
+        th_t = th_c - math.asin(2 * r / D)
+        straight = math.sqrt(D * D - 4 * r * r)
+        a0 = _mod2pi(th0 - th_t) * r
+        a1 = _mod2pi(th1 - th_t) * r
+        total = a0 + straight + a1
+        if total < best_len:
+            best_len = total
+            best = ('RSL', cR0, th_t, cL1, th_t)
+
+    # --- LSR ---
+    dx, dy = cR1[0] - cL0[0], cR1[1] - cL0[1]
+    D = math.hypot(dx, dy)
+    if D >= 2 * r:
+        th_c = math.atan2(dy, dx)
+        th_t = th_c + math.asin(2 * r / D)
+        straight = math.sqrt(D * D - 4 * r * r)
+        a0 = _mod2pi(th_t - th0) * r
+        a1 = _mod2pi(th_t - th1) * r
+        total = a0 + straight + a1
+        if total < best_len:
+            best_len = total
+            best = ('LSR', cL0, th_t, cR1, th_t)
+
+    if best is None:
+        n = max(2, int(math.hypot(x1 - x0, y1 - y0) / step))
+        return [(x0 + i / n * (x1 - x0), y0 + i / n * (y1 - y0),
+                 math.atan2(y1 - y0, x1 - x0)) for i in range(n + 1)]
+
+    ptype, c0, th_depart, c1, th_arrive = best
+
+    if ptype == 'RSR':
+        p_dep = (c0[0] - r * math.sin(th_depart), c0[1] + r * math.cos(th_depart))
+        p_arr = (c1[0] - r * math.sin(th_arrive), c1[1] + r * math.cos(th_arrive))
+        return (_sample_right_arc(c0[0], c0[1], r, th0, th_depart, step) +
+                _sample_straight(p_dep[0], p_dep[1], p_arr[0], p_arr[1], th_depart, step) +
+                _sample_right_arc(c1[0], c1[1], r, th_arrive, th1, step))
+
+    if ptype == 'LSL':
+        p_dep = (c0[0] + r * math.sin(th_depart), c0[1] - r * math.cos(th_depart))
+        p_arr = (c1[0] + r * math.sin(th_arrive), c1[1] - r * math.cos(th_arrive))
+        return (_sample_left_arc(c0[0], c0[1], r, th0, th_depart, step) +
+                _sample_straight(p_dep[0], p_dep[1], p_arr[0], p_arr[1], th_depart, step) +
+                _sample_left_arc(c1[0], c1[1], r, th_arrive, th1, step))
+
+    if ptype == 'RSL':
+        p_dep = (c0[0] - r * math.sin(th_depart), c0[1] + r * math.cos(th_depart))
+        p_arr = (c1[0] + r * math.sin(th_arrive), c1[1] - r * math.cos(th_arrive))
+        return (_sample_right_arc(c0[0], c0[1], r, th0, th_depart, step) +
+                _sample_straight(p_dep[0], p_dep[1], p_arr[0], p_arr[1], th_depart, step) +
+                _sample_left_arc(c1[0], c1[1], r, th_arrive, th1, step))
+
+    # LSR
+    p_dep = (c0[0] + r * math.sin(th_depart), c0[1] - r * math.cos(th_depart))
+    p_arr = (c1[0] - r * math.sin(th_arrive), c1[1] + r * math.cos(th_arrive))
+    return (_sample_left_arc(c0[0], c0[1], r, th0, th_depart, step) +
+            _sample_straight(p_dep[0], p_dep[1], p_arr[0], p_arr[1], th_depart, step) +
+            _sample_right_arc(c1[0], c1[1], r, th_arrive, th1, step))
 
 
 # ======================================================================
@@ -67,20 +232,28 @@ def plan_diff_drive_path(x0, y0, th0, x1, y1, th1,
 
 class SimulationNode(Node):
 
+    # ---- Planner selection -------------------------------------------
+    # 'diff_drive' — rotate in place → straight → rotate in place (supports reverse)
+    # 'dubins'     — car-like path with minimum turn radius (DUBINS_RADIUS, forward only)
+    PLANNER       = 'diff_drive'
+    DUBINS_RADIUS = 1.0    # metres; minimum turning radius for Dubins planner
+    APPROACH_DIST = 1.5    # metres; forklift stops here behind pallet entry before final insertion
+
     # ---- Forklift geometry (metres) ----------------------------------
-    BODY_LENGTH    = 2.5
-    BODY_WIDTH     = 1.2
-    BODY_HEIGHT    = 1.5
-    FORK_LENGTH    = 1.07 # 42 inches
-    FORK_WIDTH     = 0.10
+    BODY_LENGTH    = 2.830   # CAT DP70: Z extent in STL (forward/length)
+    BODY_WIDTH     = 1.230   # X extent in STL (width)
+    BODY_HEIGHT    = 1.711   # Y extent in STL (up/height)
+    FORK_LENGTH    = 1.07    # 42 inches
+    FORK_WIDTH     = 0.065   # must fit inside 71.8 mm pallet pocket
     FORK_THICKNESS = 0.07
-    FORK_Y_OFFSET  = 0.28   # lateral distance from centre to each fork
+    FORK_Y_OFFSET  = 0.369   # lateral distance from centre to each fork (from pallet mesh)
+    FORK_FACE_OFFSET = 0.610 # distance from forklift origin (front axle) to fork face (mast face)
 
     # ---- Pallet dimensions (metres) ----------------------------------
     # Frame origin: centre of the TOP surface.
-    PALLET_LENGTH  = 0.762   # x — fork-entry depth
-    PALLET_WIDTH   = 0.813   # y
-    PALLET_HEIGHT  = 0.12    # z
+    PALLET_LENGTH  = 0.762    # x — fork-entry depth  (30")
+    PALLET_WIDTH   = 0.8128   # y                     (32")
+    PALLET_HEIGHT  = 0.12065  # z                     (4.75")
 
 
     def __init__(self):
@@ -99,27 +272,68 @@ class SimulationNode(Node):
             'qx': 0.0, 'qy': 0.0, 'qz': 0.0, 'qw': 1.0,
         }
         yaw = math.radians(15.0)
+        _cam_dist = 2.0   # metres from camera (fork face) to pallet
         self.pallet_pose = {
-            'x': 6.0, 'y': 2.0, 'z': self.PALLET_HEIGHT,
+            'x': self.FORK_FACE_OFFSET + _cam_dist, 'y': 0.0, 'z': self.PALLET_HEIGHT,
             'qx': 0.0, 'qy': 0.0,
             'qz': math.sin(yaw / 2.0),
             'qw': math.cos(yaw / 2.0),
         }
 
         # Pose the forklift must reach for forks to be fully inserted
-        self.pickup_pose = self._compute_pickup_pose()
+        self.pickup_pose   = self._compute_pickup_pose()
+        # Approach pose: APPROACH_DIST behind pickup, already aligned with pallet
+        self.approach_pose = self._compute_approach_pose()
 
-        # Dubins path: forklift start → pickup pose
         self._path_waypoints = self._build_path_waypoints()
+        self._anim_idx = len(self._path_waypoints)  # stopped until triggered
+        self._loop_mode = False
 
+        self.create_subscription(Empty, '/animation/run_once', self._on_run_once, 10)
+        self.create_subscription(Empty, '/animation/loop',     self._on_loop,     10)
         self.timer = self.create_timer(0.1, self.timer_callback)
-        self.get_logger().info('Simulation node started.')
+        self.get_logger().info(
+            'Simulation node started.\n'
+            '  Run once:  ros2 topic pub --once /animation/run_once std_msgs/msg/Empty "{}"\n'
+            '  Loop:      ros2 topic pub --once /animation/loop     std_msgs/msg/Empty "{}"'
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Animation trigger                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _reset_forklift(self):
+        self.forklift_pose['x']  = 0.0
+        self.forklift_pose['y']  = 0.0
+        self.forklift_pose['qz'] = 0.0
+        self.forklift_pose['qw'] = 1.0
+        self._anim_idx = 0
+
+    def _on_run_once(self, _msg):
+        self._loop_mode = False
+        self._reset_forklift()
+        self.get_logger().info('Mode: run once.')
+
+    def _on_loop(self, _msg):
+        self._loop_mode = True
+        self._reset_forklift()
+        self.get_logger().info('Mode: continuous loop.')
 
     # ------------------------------------------------------------------ #
     #  Timer                                                               #
     # ------------------------------------------------------------------ #
 
     def timer_callback(self):
+        if self._anim_idx >= len(self._path_waypoints) and self._loop_mode:
+            self._reset_forklift()
+        if self._anim_idx < len(self._path_waypoints):
+            x, y, th = self._path_waypoints[self._anim_idx]
+            self.forklift_pose['x']  = x
+            self.forklift_pose['y']  = y
+            self.forklift_pose['qz'] = math.sin(th / 2.0)
+            self.forklift_pose['qw'] = math.cos(th / 2.0)
+            self._anim_idx += 1
+
         now = self.get_clock().now().to_msg()
         self._publish_transforms(now)
         self._publish_markers(now)
@@ -169,50 +383,62 @@ class SimulationNode(Node):
 
     def _publish_markers(self, now):
         markers = MarkerArray()
-        markers.markers += self._forklift_markers(now, frame='forklift', id_base=0,  alpha=0.95)
+        markers.markers += self._forklift_markers(now, frame='forklift', id_base=0,  alpha=1.00)
         markers.markers += self._forklift_markers(now, frame='pickup',   id_base=20, alpha=0.30)
         markers.markers += self._pallet_markers(now)
         self.marker_pub.publish(markers)
+
+    # --- Forklift STL constants --------------------------------------- #
+    # forklift.stl (CAT DP70): exported from FreeCAD in mm.
+    #   STL axes: X=width(1230 mm), Y=up/height(1711 mm), Z=forward/length(2830 mm)
+    #   FreeCAD origin: front drivetrain (front axle) at ground level
+    #     → X=0 is lateral centre, Y=0 is ground, Z=0 is front axle
+    #   ROS convention: X=forward, Z=up
+    #   Rotation rpy=(π/2, 0, π/2) → q=(w=0.5, x=0.5, y=0.5, z=0.5)
+    #   After rotation: STL-Z → ROS-X, STL-X → ROS-Y, STL-Y → ROS-Z
+    #   No position offset needed: origin is already at ground-centre on the
+    #   front axle, which is the reference point for fork-insertion geometry.
+    # Uniform scale = 0.001 (mm → m)
+    _STL_FK_Y_EXTENT = 1711.0   # mm; drives uniform scale (mm → m)
 
     # --- Forklift (solid) and pickup target (ghost) ------------------- #
 
     def _forklift_markers(self, now, frame, id_base, alpha):
         """
-        Draws forklift body + forks in `frame`.
+        Draws forklift mesh in `frame`.
         id_base offsets IDs so forklift and pickup markers don't collide.
         alpha < 0.5 → ghost/target style (blue); alpha ≥ 0.5 → solid (orange).
         """
         markers = []
         solid = alpha >= 0.5
-        br, bg, bb = (1.0, 0.5, 0.0) if solid else (0.3, 0.6, 1.0)
-        fr, fg, fb = (0.9, 0.9, 0.1) if solid else (0.5, 0.7, 1.0)
+        r, g, b = (1.0, 0.5, 0.0) if solid else (0.3, 0.6, 1.0)
 
-        # Body
-        m = self._base_marker(frame, id_base, now, Marker.CUBE)
-        m.pose.position.z  = self.BODY_HEIGHT / 2.0
-        m.pose.orientation.w = 1.0
-        m.scale.x = self.BODY_LENGTH
-        m.scale.y = self.BODY_WIDTH
-        m.scale.z = self.BODY_HEIGHT
-        m.color.r, m.color.g, m.color.b, m.color.a = br, bg, bb, alpha
+        # Uniform scale: mm → m  (BODY_HEIGHT[m] / Y_extent[mm] = 0.001)
+        s = self.BODY_HEIGHT / self._STL_FK_Y_EXTENT
+
+        # Mesh
+        m = self._base_marker(frame, id_base, now, Marker.MESH_RESOURCE)
+        m.mesh_resource = 'package://trajectory_viz/meshes/forklift.stl'
+        m.mesh_use_embedded_materials = False
+        m.scale.x = s
+        m.scale.y = s
+        m.scale.z = s
+        # rpy=(π/2, 0, π/2) → q=(0.5, 0.5, 0.5, 0.5)
+        # Maps: STL-Z(forward) → ROS-X, STL-X(width) → ROS-Y, STL-Y(up) → ROS-Z
+        m.pose.orientation.w = 0.5
+        m.pose.orientation.x = 0.5
+        m.pose.orientation.y = 0.5
+        m.pose.orientation.z = 0.5
+        # FreeCAD origin is front axle at ground → no position offset needed
+        m.pose.position.x = 0.0
+        m.pose.position.y = 0.0
+        m.pose.position.z = 0.0
+        m.color.r, m.color.g, m.color.b, m.color.a = r, g, b, alpha
         markers.append(m)
 
-        # Left and right forks
-        for i, y_off in enumerate([+self.FORK_Y_OFFSET, -self.FORK_Y_OFFSET]):
-            m = self._base_marker(frame, id_base + 1 + i, now, Marker.CUBE)
-            m.pose.position.x = self.BODY_LENGTH / 2.0 + self.FORK_LENGTH / 2.0
-            m.pose.position.y = y_off
-            m.pose.position.z = self.FORK_THICKNESS / 2.0
-            m.pose.orientation.w = 1.0
-            m.scale.x = self.FORK_LENGTH
-            m.scale.y = self.FORK_WIDTH
-            m.scale.z = self.FORK_THICKNESS
-            m.color.r, m.color.g, m.color.b, m.color.a = fr, fg, fb, alpha
-            markers.append(m)
-
         # Label
-        m = self._base_marker(frame, id_base + 3, now, Marker.TEXT_VIEW_FACING)
-        m.pose.position.z  = self.BODY_HEIGHT + 0.4
+        m = self._base_marker(frame, id_base + 1, now, Marker.TEXT_VIEW_FACING)
+        m.pose.position.z = self.BODY_HEIGHT + 0.4
         m.pose.orientation.w = 1.0
         m.scale.z = 0.4
         m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 1.0, 1.0, alpha
@@ -223,18 +449,40 @@ class SimulationNode(Node):
 
     # --- Pallet ------------------------------------------------------- #
 
+    # pallet.stl: exported from FreeCAD in metres; Z is up (matches ROS convention).
+    #   Bounding box: X=[0, 0.762], Y=[0.019, 0.832], Z=[0, 0.121]
+    #   Origin is at a corner on the ground — not centred.
+    #   Scale = PALLET_DIM[m] / _STL_RANGE[m] ≈ 1.0 on all axes.
+    #   No rotation needed (Z_stl=up already matches ROS Z=up).
+    _STL_X_RANGE  = 0.762
+    _STL_Y_RANGE  = 0.813
+    _STL_Y_CENTER = 0.4255  # (0.019 + 0.832) / 2
+    _STL_Z_RANGE  = 0.121
+
     def _pallet_markers(self, now):
         markers = []
-        h = self.PALLET_HEIGHT
+        h  = self.PALLET_HEIGHT
+        pl = self.PALLET_LENGTH
+        pw = self.PALLET_WIDTH
 
-        # Body — origin is top surface, so centre is h/2 below
-        m = self._base_marker('pallet', 10, now, Marker.CUBE)
-        m.pose.position.z  = -h / 2.0
-        m.pose.orientation.w = 1.0
-        m.scale.x = self.PALLET_LENGTH
-        m.scale.y = self.PALLET_WIDTH
-        m.scale.z = h
-        m.color.r, m.color.g, m.color.b, m.color.a = 0.55, 0.27, 0.07, 0.95
+        # Mesh — replaces the plain CUBE
+        m = self._base_marker('pallet', 10, now, Marker.MESH_RESOURCE)
+        m.mesh_resource = 'package://trajectory_viz/meshes/pallet.stl'
+        m.mesh_use_embedded_materials = False
+        m.scale.x = pl / self._STL_X_RANGE
+        m.scale.y = pw / self._STL_Y_RANGE
+        m.scale.z = h  / self._STL_Z_RANGE
+        # 90° Z rotation: STL-X → pallet-(-Y), STL-Y → pallet-(+X)
+        # Position offsets must account for the rotated axes:
+        #   pallet-X centre ← STL-Y centre (_STL_Y_CENTER)
+        #   pallet-Y centre ← STL-X centre (_STL_X_RANGE/2), sign flipped
+        #   pallet-Z: STL Z=0 is ground, Z=range is top → shift so top is at z=0
+        m.pose.position.x =  self._STL_Y_CENTER         * m.scale.y
+        m.pose.position.y = -(self._STL_X_RANGE / 2.0) * m.scale.x
+        m.pose.position.z = -h
+        m.pose.orientation.w = 0.7071068
+        m.pose.orientation.z = 0.7071068
+        m.color.r, m.color.g, m.color.b, m.color.a = 0.55, 0.27, 0.07, 1.00
         markers.append(m)
 
         # Fork-entry arrow (just above top surface, spanning full depth)
@@ -322,18 +570,19 @@ class SimulationNode(Node):
         fully inserted into the pallet.
 
         Geometry:
-          - Forklift faces along the pallet's +X (fork-entry) axis.
+          - Forklift frame origin is the front axle at ground level.
+          - Forks mount at the front axle and extend FORK_LENGTH forward.
           - Fork tips reach the far edge of the pallet (+PALLET_LENGTH/2
             in pallet frame) → full insertion.
-          - fork_tip_reach = BODY_LENGTH/2 + FORK_LENGTH from forklift origin.
-          - Forklift origin is therefore (fork_tip_reach - PALLET_LENGTH/2)
+          - fork_tip_reach = FORK_LENGTH from forklift origin (front axle).
+          - Forklift origin is therefore (FORK_LENGTH - PALLET_LENGTH/2)
             metres behind the pallet centre, along pallet -X.
         """
         pp = self.pallet_pose
         pallet_yaw = 2.0 * math.atan2(pp['qz'], pp['qw'])
 
-        fork_tip_reach = self.BODY_LENGTH / 2.0 + self.FORK_LENGTH
-        offset         = fork_tip_reach - self.PALLET_LENGTH / 2.0
+        fork_tip_reach = self.FORK_LENGTH
+        offset         = fork_tip_reach - self.PALLET_LENGTH / 2.0 + 0.10  # 150 mm short of full insertion
 
         x = pp['x'] - offset * math.cos(pallet_yaw)
         y = pp['y'] - offset * math.sin(pallet_yaw)
@@ -346,29 +595,66 @@ class SimulationNode(Node):
             'qw': math.cos(pallet_yaw / 2.0),
         }
 
+    def _compute_approach_pose(self):
+        """
+        Compute the approach pose: APPROACH_DIST metres behind the pickup pose
+        along the pallet entry axis. The forklift is already aligned with the
+        pallet yaw here, so the final segment to pickup is a straight drive.
+        """
+        pp = self.pickup_pose
+        return {
+            'x':  pp['x'] - self.APPROACH_DIST * math.cos(pp['th']),
+            'y':  pp['y'] - self.APPROACH_DIST * math.sin(pp['th']),
+            'th': pp['th'],
+            'qz': pp['qz'],
+            'qw': pp['qw'],
+        }
+
     # ------------------------------------------------------------------ #
     #  Path planning                                                       #
     # ------------------------------------------------------------------ #
 
     def _build_path_waypoints(self):
         """
-        Plan a differential-drive path from the forklift's current pose
-        to the pickup pose: rotate in place → drive straight → rotate in place.
+        Two-segment path: start → approach_pose → pickup_pose.
+
+        Segment 1 (start → approach): uses selected planner.
+        Segment 2 (approach → pickup): always a straight forward drive —
+          the forklift is already aligned with the pallet axis at approach_pose.
         """
         fp  = self.forklift_pose
         th0 = 2.0 * math.atan2(fp['qz'], fp['qw'])
 
+        ap  = self.approach_pose
         pp  = self.pickup_pose
-        th1 = pp['th']
 
-        waypoints = plan_diff_drive_path(
-            fp['x'], fp['y'], th0,
-            pp['x'], pp['y'], th1,
-        )
-        dist = math.hypot(pp['x'] - fp['x'], pp['y'] - fp['y'])
+        if self.PLANNER == 'dubins':
+            seg1 = plan_dubins_path(
+                fp['x'], fp['y'], th0,
+                ap['x'], ap['y'], ap['th'],
+                min_radius=self.DUBINS_RADIUS,
+            )
+            label = f'Dubins (r={self.DUBINS_RADIUS} m)'
+        else:
+            seg1 = plan_diff_drive_path(
+                fp['x'], fp['y'], th0,
+                ap['x'], ap['y'], ap['th'],
+            )
+            label = 'Diff-drive'
+
+        # Straight insertion run: approach → pickup (already aligned)
+        n = max(2, int(self.APPROACH_DIST / 0.15))
+        seg2 = [
+            (ap['x'] + (i / n) * (pp['x'] - ap['x']),
+             ap['y'] + (i / n) * (pp['y'] - ap['y']),
+             ap['th'])
+            for i in range(n + 1)
+        ]
+
+        waypoints = seg1 + seg2
         self.get_logger().info(
-            f'Diff-drive path: {len(waypoints)} waypoints, '
-            f'straight dist: {dist:.2f} m'
+            f'{label} path: {len(seg1)} + {len(seg2)} waypoints '
+            f'(approach + insertion)'
         )
         return waypoints
 

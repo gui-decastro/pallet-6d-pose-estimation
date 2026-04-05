@@ -17,7 +17,7 @@ setup(
         (os.path.join('share', package_name, 'config'),
             glob('config/*.rviz')),
         (os.path.join('share', package_name, 'meshes'),
-            glob('meshes/*')),
+            [f for f in glob('meshes/*') if os.path.isfile(f)]),
         (os.path.join('share', package_name, 'scripts'),
             glob('scripts/*.sh')),
     ],
