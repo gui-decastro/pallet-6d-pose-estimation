@@ -5,6 +5,7 @@ from std_msgs.msg import Empty
 from nav_msgs.msg import Path
 from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import TransformBroadcaster
+import bisect
 import math
 
 # ======================================================================
@@ -237,7 +238,11 @@ class SimulationNode(Node):
     # 'dubins'     — car-like path with minimum turn radius (DUBINS_RADIUS, forward only)
     PLANNER       = 'diff_drive'
     DUBINS_RADIUS = 1.0    # metres; minimum turning radius for Dubins planner
-    APPROACH_DIST = 1.5    # metres; forklift stops here behind pallet entry before final insertion
+    APPROACH_DIST = 1.0    # metres; forklift stops here behind pallet entry before final insertion
+
+    # ---- Animation speed limits ------------------------------------
+    ANIM_LINEAR_SPEED  = 0.2   # m/s   — cruising speed (~3 km/h, typical loaded forklift)
+    ANIM_ANGULAR_SPEED = 0.25  # rad/s — in-place turn (~14°/s, heavy vehicle)
 
     # ---- Forklift geometry (metres) ----------------------------------
     BODY_LENGTH    = 2.830   # CAT DP70: Z extent in STL (forward/length)
@@ -247,7 +252,8 @@ class SimulationNode(Node):
     FORK_WIDTH     = 0.065   # must fit inside 71.8 mm pallet pocket
     FORK_THICKNESS = 0.07
     FORK_Y_OFFSET  = 0.369   # lateral distance from centre to each fork (from pallet mesh)
-    FORK_FACE_OFFSET = 0.610 # distance from forklift origin (front axle) to fork face (mast face)
+    # CAMERA_X_OFFSET = 0.610 # distance from forklift origin (front axle) to fork face (mast face)
+    CAMERA_X_OFFSET = 0.335 # distance from forklift origin (front axle) to fork face (mast face)
 
     # ---- Pallet dimensions (metres) ----------------------------------
     # Frame origin: centre of the TOP surface.
@@ -255,42 +261,62 @@ class SimulationNode(Node):
     PALLET_WIDTH   = 0.8128   # y                     (32")
     PALLET_HEIGHT  = 0.12065  # z                     (4.75")
 
+    # ---- Manual pallet poses (edit here for testing) -----------------
+    # X and Y are in the CAMERA frame (fork face), not the forklift origin.
+    # e.g. EST_PALLET_X = 2.0 means 2 m in front of the camera.
+    # In production these are overridden by incoming ROS PoseStamped msgs
+    # on /est_pallet_pose_in and /gt_pallet_pose_in (same camera-frame convention).
+    EST_PALLET_X   = 2.0             # metres in front of camera (fork face)
+    EST_PALLET_Y   = 0.1             # metres lateral from camera
+    EST_PALLET_YAW = math.radians(16.0)  # heading (radians)
+
+    GT_PALLET_X    = 2.0
+    GT_PALLET_Y    = 0.0
+    GT_PALLET_YAW  = math.radians(15.0)
+
 
     def __init__(self):
         super().__init__('simulation_node')
 
-        self.marker_pub        = self.create_publisher(MarkerArray, '/visualization_markers', 10)
+        self.marker_pub          = self.create_publisher(MarkerArray, '/visualization_markers',   10)
+        self.floor_pub           = self.create_publisher(MarkerArray, '/warehouse_floor',         10)
+        self.est_pallet_pub      = self.create_publisher(MarkerArray, '/pallet_estimated',        10)
+        self.gt_pallet_pub       = self.create_publisher(MarkerArray, '/pallet_ground_truth',     10)
+        self.approach_marker_pub = self.create_publisher(MarkerArray, '/approach_marker',         10)
+        self.fov_pub             = self.create_publisher(MarkerArray, '/fov_lines',               10)
         self.path_pub          = self.create_publisher(Path, '/trajectory', 10)
         self.forklift_pose_pub = self.create_publisher(PoseStamped, '/forklift_pose', 10)
-        self.pallet_pose_pub   = self.create_publisher(PoseStamped, '/pallet_pose', 10)
+        self.est_pallet_pose_pub   = self.create_publisher(PoseStamped, '/est_pallet_pose', 10)
 
         self.tf_broadcaster = TransformBroadcaster(self)
 
-        # --- Poses (replace with real estimates in production) -----------
         self.forklift_pose = {
-            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'x': -self.CAMERA_X_OFFSET, 'y': 0.0, 'z': 0.0,
             'qx': 0.0, 'qy': 0.0, 'qz': 0.0, 'qw': 1.0,
         }
-        yaw = math.radians(15.0)
-        _cam_dist = 2.0   # metres from camera (fork face) to pallet
-        self.pallet_pose = {
-            'x': self.FORK_FACE_OFFSET + _cam_dist, 'y': 0.0, 'z': self.PALLET_HEIGHT,
-            'qx': 0.0, 'qy': 0.0,
-            'qz': math.sin(yaw / 2.0),
-            'qw': math.cos(yaw / 2.0),
-        }
+        self.est_pallet_pose       = self._pose_from_xyyaw(
+            self.EST_PALLET_X, self.EST_PALLET_Y, self.EST_PALLET_YAW)
+        self.ground_truth_pallet_pose = self._pose_from_xyyaw(
+            self.GT_PALLET_X,  self.GT_PALLET_Y,  self.GT_PALLET_YAW)
+
 
         # Pose the forklift must reach for forks to be fully inserted
         self.pickup_pose   = self._compute_pickup_pose()
         # Approach pose: APPROACH_DIST behind pickup, already aligned with pallet
         self.approach_pose = self._compute_approach_pose()
 
-        self._path_waypoints = self._build_path_waypoints()
-        self._anim_idx = len(self._path_waypoints)  # stopped until triggered
-        self._loop_mode = False
+        self._path_waypoints  = self._build_path_waypoints()
+        self._waypoint_times  = self._build_waypoint_times()
+        self._phase_times     = self._build_phase_times()
+        self._anim_time  = self._waypoint_times[-1]  # stopped until triggered
+        self._loop_mode  = False
 
-        self.create_subscription(Empty, '/animation/run_once', self._on_run_once, 10)
-        self.create_subscription(Empty, '/animation/loop',     self._on_loop,     10)
+        self.create_subscription(PoseStamped, '/est_pallet_pose_in', self._on_est_pallet_pose, 10)
+        self.create_subscription(PoseStamped, '/gt_pallet_pose_in',  self._on_gt_pallet_pose,  10)
+        self.create_subscription(Empty, '/animation/run_once',  self._on_run_once,  10)
+        self.create_subscription(Empty, '/animation/loop',      self._on_loop,      10)
+        self.create_subscription(Empty, '/animation/goto_start', self._on_goto_start, 10)
+        self.create_subscription(Empty, '/animation/goto_end',   self._on_goto_end,   10)
         self.timer = self.create_timer(0.1, self.timer_callback)
         self.get_logger().info(
             'Simulation node started.\n'
@@ -302,12 +328,44 @@ class SimulationNode(Node):
     #  Animation trigger                                                   #
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    #  Pallet pose helpers                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _pose_from_xyyaw(self, x, y, yaw):
+        """x, y are in the camera (fork face) frame; world origin IS the camera."""
+        yaw_gt = yaw + math.pi  # +X faces forklift convention
+        return {
+            'x': x, 'y': y, 'z': self.PALLET_HEIGHT,
+            'qx': 0.0, 'qy': 0.0,
+            'qz': math.sin(yaw_gt / 2.0),
+            'qw': math.cos(yaw_gt / 2.0),
+        }
+
+    def _on_est_pallet_pose(self, msg):
+        q = msg.pose.orientation
+        yaw = 2.0 * math.atan2(q.z, q.w)
+        self.est_pallet_pose  = self._pose_from_xyyaw(
+            msg.pose.position.x, msg.pose.position.y, yaw)
+        # Recompute trajectory to new estimated pallet pose
+        self.pickup_pose     = self._compute_pickup_pose()
+        self.approach_pose   = self._compute_approach_pose()
+        self._path_waypoints = self._build_path_waypoints()
+        self._waypoint_times = self._build_waypoint_times()
+        self._phase_times    = self._build_phase_times()
+
+    def _on_gt_pallet_pose(self, msg):
+        q = msg.pose.orientation
+        yaw = 2.0 * math.atan2(q.z, q.w)
+        self.ground_truth_pallet_pose = self._pose_from_xyyaw(
+            msg.pose.position.x, msg.pose.position.y, yaw)
+
     def _reset_forklift(self):
-        self.forklift_pose['x']  = 0.0
+        self.forklift_pose['x']  = -self.CAMERA_X_OFFSET
         self.forklift_pose['y']  = 0.0
         self.forklift_pose['qz'] = 0.0
         self.forklift_pose['qw'] = 1.0
-        self._anim_idx = 0
+        self._anim_time = 0.0
 
     def _on_run_once(self, _msg):
         self._loop_mode = False
@@ -319,26 +377,135 @@ class SimulationNode(Node):
         self._reset_forklift()
         self.get_logger().info('Mode: continuous loop.')
 
+    def _on_goto_start(self, _msg):
+        self._loop_mode = False
+        self._reset_forklift()
+        self._anim_time = self._waypoint_times[-1]  # park at start, don't animate
+        self.get_logger().info('Showing start pose.')
+
+    def _on_goto_end(self, _msg):
+        self._loop_mode = False
+        x, y, th = self._path_waypoints[-1]
+        self.forklift_pose['x']  = x
+        self.forklift_pose['y']  = y
+        self.forklift_pose['qz'] = math.sin(th / 2.0)
+        self.forklift_pose['qw'] = math.cos(th / 2.0)
+        self._anim_time = self._waypoint_times[-1]  # park at end, don't animate
+        self.get_logger().info('Showing end pose.')
+
     # ------------------------------------------------------------------ #
     #  Timer                                                               #
     # ------------------------------------------------------------------ #
 
     def timer_callback(self):
-        if self._anim_idx >= len(self._path_waypoints) and self._loop_mode:
+        total = self._waypoint_times[-1]
+        if self._anim_time >= total and self._loop_mode:
             self._reset_forklift()
-        if self._anim_idx < len(self._path_waypoints):
-            x, y, th = self._path_waypoints[self._anim_idx]
+        if self._anim_time < total:
+            x, y, th = self._interpolate_pose(self._anim_time)
             self.forklift_pose['x']  = x
             self.forklift_pose['y']  = y
             self.forklift_pose['qz'] = math.sin(th / 2.0)
             self.forklift_pose['qw'] = math.cos(th / 2.0)
-            self._anim_idx += 1
+            self._anim_time += 0.1
 
         now = self.get_clock().now().to_msg()
         self._publish_transforms(now)
         self._publish_markers(now)
         self._publish_poses(now)
         self._publish_trajectory(now)
+        self._publish_approach_marker(now)
+        self._publish_floor(now)
+        self._publish_fov_lines(now)
+
+    # ------------------------------------------------------------------ #
+    #  Velocity profile                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _build_waypoint_times(self):
+        """
+        Assign a wall-clock timestamp to each waypoint based on geometry:
+          - Translation steps use ANIM_LINEAR_SPEED.
+          - Rotation-in-place steps (x,y unchanged) use ANIM_ANGULAR_SPEED.
+        """
+        times = [0.0]
+        for i in range(1, len(self._path_waypoints)):
+            x0, y0, th0 = self._path_waypoints[i - 1]
+            x1, y1, th1 = self._path_waypoints[i]
+            dist = math.hypot(x1 - x0, y1 - y0)
+            dth  = abs(_angle_diff(th1, th0))
+            if dist > 1e-4:
+                dt = dist / self.ANIM_LINEAR_SPEED
+            else:
+                dt = dth / self.ANIM_ANGULAR_SPEED if dth > 1e-4 else 0.0
+            times.append(times[-1] + max(dt, 1e-4))
+        return times
+
+    def _build_phase_times(self):
+        """
+        Group consecutive waypoints into contiguous phases (rotation or translation)
+        and return the (t_start, t_end) time range for each phase.
+        Smoothstep is later applied across each phase as a whole so that the
+        forklift ramps up/down over the full duration of each movement.
+        """
+        pts   = self._path_waypoints
+        times = self._waypoint_times
+        if len(pts) < 2:
+            return [(0.0, times[-1])]
+
+        def _is_translation(i):
+            x0, y0, _ = pts[i]
+            x1, y1, _ = pts[i + 1]
+            return math.hypot(x1 - x0, y1 - y0) > 1e-4
+
+        phases = []
+        phase_start = 0
+        current = _is_translation(0)
+        for i in range(1, len(pts) - 1):
+            seg_type = _is_translation(i)
+            if seg_type != current:
+                phases.append((times[phase_start], times[i]))
+                phase_start = i
+                current = seg_type
+        phases.append((times[phase_start], times[-1]))
+        return phases
+
+    def _apply_phase_smoothstep(self, t):
+        """
+        Map raw animation time t through a per-phase quintic smootherstep.
+        Each phase (rotation or translation) gets its own ease-in/ease-out so
+        the forklift accelerates and decelerates smoothly within every segment.
+        """
+        for (t_start, t_end) in self._phase_times:
+            if t <= t_end:
+                duration = t_end - t_start
+                if duration < 1e-6:
+                    return t
+                u = (t - t_start) / duration
+                u = u * u * u * (u * (u * 6.0 - 15.0) + 10.0)  # quintic smootherstep
+                return t_start + u * duration
+        return t
+
+    def _interpolate_pose(self, t):
+        """Return (x, y, theta) at time t by linear interpolation between waypoints."""
+        times = self._waypoint_times
+        pts   = self._path_waypoints
+        if t <= 0.0:
+            return pts[0]
+        if t >= times[-1]:
+            return pts[-1]
+        t = self._apply_phase_smoothstep(t)
+        i = bisect.bisect_right(times, t) - 1
+        i = max(0, min(i, len(pts) - 2))
+        t0, t1 = times[i], times[i + 1]
+        alpha = (t - t0) / (t1 - t0) if t1 > t0 else 1.0
+        x0, y0, th0 = pts[i]
+        x1, y1, th1 = pts[i + 1]
+        return (
+            x0 + alpha * (x1 - x0),
+            y0 + alpha * (y1 - y0),
+            th0 + alpha * _angle_diff(th1, th0),
+        )
 
     # ------------------------------------------------------------------ #
     #  TF                                                                  #
@@ -347,8 +514,9 @@ class SimulationNode(Node):
     def _publish_transforms(self, now):
         transforms = []
 
-        for child, pose in [('forklift', self.forklift_pose),
-                             ('pallet',   self.pallet_pose)]:
+        for child, pose in [('forklift',  self.forklift_pose),
+                             ('pallet_est', self.est_pallet_pose),
+                             ('pallet_gt', self.ground_truth_pallet_pose)]:
             tf = TransformStamped()
             tf.header.stamp    = now
             tf.header.frame_id = 'world'
@@ -383,10 +551,16 @@ class SimulationNode(Node):
 
     def _publish_markers(self, now):
         markers = MarkerArray()
-        markers.markers += self._forklift_markers(now, frame='forklift', id_base=0,  alpha=1.00)
-        markers.markers += self._forklift_markers(now, frame='pickup',   id_base=20, alpha=0.30)
-        markers.markers += self._pallet_markers(now)
+        markers.markers += self._forklift_markers(now, frame='forklift', id_base=0, alpha=1.00)
         self.marker_pub.publish(markers)
+
+        est = MarkerArray()
+        est.markers += self._pallet_markers(now)
+        self.est_pallet_pub.publish(est)
+
+        gt = MarkerArray()
+        gt.markers += self._ground_truth_pallet_markers(now)
+        self.gt_pallet_pub.publish(gt)
 
     # --- Forklift STL constants --------------------------------------- #
     # forklift.stl (CAT DP70): exported from FreeCAD in mm.
@@ -436,15 +610,6 @@ class SimulationNode(Node):
         m.color.r, m.color.g, m.color.b, m.color.a = r, g, b, alpha
         markers.append(m)
 
-        # Label
-        m = self._base_marker(frame, id_base + 1, now, Marker.TEXT_VIEW_FACING)
-        m.pose.position.z = self.BODY_HEIGHT + 0.4
-        m.pose.orientation.w = 1.0
-        m.scale.z = 0.4
-        m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 1.0, 1.0, alpha
-        m.text = 'FORKLIFT' if solid else 'PICKUP TARGET'
-        markers.append(m)
-
         return markers
 
     # --- Pallet ------------------------------------------------------- #
@@ -466,7 +631,7 @@ class SimulationNode(Node):
         pw = self.PALLET_WIDTH
 
         # Mesh — replaces the plain CUBE
-        m = self._base_marker('pallet', 10, now, Marker.MESH_RESOURCE)
+        m = self._base_marker('pallet_est', 10, now, Marker.MESH_RESOURCE)
         m.mesh_resource = 'package://trajectory_viz/meshes/pallet.stl'
         m.mesh_use_embedded_materials = False
         m.scale.x = pl / self._STL_X_RANGE
@@ -482,30 +647,168 @@ class SimulationNode(Node):
         m.pose.position.z = -h
         m.pose.orientation.w = 0.7071068
         m.pose.orientation.z = 0.7071068
-        m.color.r, m.color.g, m.color.b, m.color.a = 0.55, 0.27, 0.07, 1.00
-        markers.append(m)
-
-        # Fork-entry arrow (just above top surface, spanning full depth)
-        m = self._base_marker('pallet', 11, now, Marker.ARROW)
-        m.pose.position.x  = -self.PALLET_LENGTH / 2.0
-        m.pose.position.z  = 0.03
-        m.pose.orientation.w = 1.0
-        m.scale.x = self.PALLET_LENGTH   # shaft length
-        m.scale.y = 0.08                  # shaft diameter
-        m.scale.z = 0.12                  # head diameter
-        m.color.r, m.color.g, m.color.b, m.color.a = 0.1, 0.9, 0.1, 0.9
+        m.color.r, m.color.g, m.color.b, m.color.a = 0.2, 0.7, 1.0, 0.40
         markers.append(m)
 
         # Label
-        m = self._base_marker('pallet', 12, now, Marker.TEXT_VIEW_FACING)
+        m = self._base_marker('pallet_est', 12, now, Marker.TEXT_VIEW_FACING)
         m.pose.position.z  = 0.45
         m.pose.orientation.w = 1.0
-        m.scale.z = 0.4
-        m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 1.0, 1.0, 1.0
-        m.text = 'PALLET (estimated)'
+        m.scale.z = 0.35
+        m.color.r, m.color.g, m.color.b, m.color.a = 0.4, 0.8, 1.0, 0.60
+        m.text = 'estimated'
         markers.append(m)
 
         return markers
+
+    def _ground_truth_pallet_markers(self, now):
+        """Transparent pallet mesh showing the ground truth pose."""
+        markers = []
+        h  = self.PALLET_HEIGHT
+        pl = self.PALLET_LENGTH
+        pw = self.PALLET_WIDTH
+
+        m = self._base_marker('pallet_gt', 10, now, Marker.MESH_RESOURCE)
+        m.mesh_resource = 'package://trajectory_viz/meshes/pallet.stl'
+        m.mesh_use_embedded_materials = False
+        m.scale.x = pl / self._STL_X_RANGE
+        m.scale.y = pw / self._STL_Y_RANGE
+        m.scale.z = h  / self._STL_Z_RANGE
+        m.pose.position.x =  self._STL_Y_CENTER        * m.scale.y
+        m.pose.position.y = -(self._STL_X_RANGE / 2.0) * m.scale.x
+        m.pose.position.z = -h
+        m.pose.orientation.w = 0.7071068
+        m.pose.orientation.z = 0.7071068
+        m.color.r, m.color.g, m.color.b, m.color.a = 0.55, 0.27, 0.07, 1.00
+        markers.append(m)
+
+        m = self._base_marker('pallet_gt', 12, now, Marker.TEXT_VIEW_FACING)
+        m.pose.position.z  = 0.45
+        m.pose.orientation.w = 1.0
+        m.scale.z = 0.35
+        m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 1.0, 1.0, 1.0
+        m.text = 'ground truth'
+        markers.append(m)
+
+        return markers
+
+    def _publish_approach_marker(self, now):
+        msg = MarkerArray()
+        msg.markers += self._approach_markers(now)
+        self.approach_marker_pub.publish(msg)
+
+    def _approach_markers(self, now):
+        """Arrow + label showing the approach pose in the world frame."""
+        ap = self.approach_pose
+        markers = []
+
+        # Arrow pointing in the forklift heading direction at approach
+        m = Marker()
+        m.header.stamp    = now
+        m.header.frame_id = 'world'
+        m.ns              = 'approach'
+        m.id              = 0
+        m.type            = Marker.ARROW
+        m.action          = Marker.ADD
+        m.pose.position.x = ap['x']
+        m.pose.position.y = ap['y']
+        m.pose.position.z = 0.1
+        m.pose.orientation.z = ap['qz']
+        m.pose.orientation.w = ap['qw']
+        m.scale.x = 0.8    # shaft length
+        m.scale.y = 0.06   # shaft diameter
+        m.scale.z = 0.10   # head diameter
+        m.color.r, m.color.g, m.color.b, m.color.a = 0.8, 0.8, 0.8, 0.5
+        markers.append(m)
+
+        # Label
+        m = Marker()
+        m.header.stamp    = now
+        m.header.frame_id = 'world'
+        m.ns              = 'approach'
+        m.id              = 1
+        m.type            = Marker.TEXT_VIEW_FACING
+        m.action          = Marker.ADD
+        m.pose.position.x = ap['x']
+        m.pose.position.y = ap['y']
+        m.pose.position.z = 0.6
+        m.pose.orientation.w = 1.0
+        m.scale.z = 0.25
+        m.color.r, m.color.g, m.color.b, m.color.a = 0.8, 0.8, 0.8, 0.5
+        m.text = 'approach'
+        markers.append(m)
+
+        return markers
+
+    # ------------------------------------------------------------------ #
+    #  Warehouse floor                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _publish_floor(self, now):
+        msg = MarkerArray()
+        msg.markers += self._floor_markers(now)
+        self.floor_pub.publish(msg)
+
+    def _floor_markers(self, now):
+        markers = []
+
+        def _wm(mid, mtype):
+            m = Marker()
+            m.header.stamp    = now
+            m.header.frame_id = 'world'
+            m.ns              = 'floor'
+            m.id              = mid
+            m.type            = mtype
+            m.action          = Marker.ADD
+            m.pose.orientation.w = 1.0
+            return m
+
+        # Concrete slab — 30 x 30 m x 0.3 m thick, top surface flush with z=0
+        m = _wm(0, Marker.CUBE)
+        m.pose.position.x =  5.0
+        m.pose.position.y =  0.0
+        m.pose.position.z = -0.15
+        m.scale.x = 30.0
+        m.scale.y = 30.0
+        m.scale.z =  0.30
+        m.color.r, m.color.g, m.color.b, m.color.a = 0.42, 0.42, 0.40, 1.0
+        markers.append(m)
+
+        return markers
+
+    # ------------------------------------------------------------------ #
+    #  FOV lines                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _publish_fov_lines(self, now):
+        length     = 3.0
+        tape_width = 0.05
+        tape_thick = 0.002   # essentially flush with z=0
+
+        markers = []
+        for mid, deg in enumerate((0, -30, 30)):
+            rad = math.radians(deg)
+            m = Marker()
+            m.header.stamp    = now
+            m.header.frame_id = 'world'
+            m.ns              = 'fov'
+            m.id              = mid
+            m.type            = Marker.CUBE
+            m.action          = Marker.ADD
+            # Centre the box halfway along the ray
+            m.pose.position.x = (length / 2.0) * math.cos(rad)
+            m.pose.position.y = (length / 2.0) * math.sin(rad)
+            m.pose.position.z = tape_thick / 2.0
+            # Rotate box so its long axis (X) points along the ray
+            m.pose.orientation.z = math.sin(rad / 2.0)
+            m.pose.orientation.w = math.cos(rad / 2.0)
+            m.scale.x = length
+            m.scale.y = tape_width
+            m.scale.z = tape_thick
+            m.color.r, m.color.g, m.color.b, m.color.a = 0.1, 0.35, 0.9, 1.0
+            markers.append(m)
+
+        self.fov_pub.publish(MarkerArray(markers=markers))
 
     def _base_marker(self, frame, marker_id, now, mtype):
         m = Marker()
@@ -524,7 +827,7 @@ class SimulationNode(Node):
     def _publish_poses(self, now):
         for pub, pose in [
             (self.forklift_pose_pub, self.forklift_pose),
-            (self.pallet_pose_pub,   self.pallet_pose),
+            (self.est_pallet_pose_pub,   self.est_pallet_pose),
         ]:
             msg = PoseStamped()
             msg.header.stamp    = now
@@ -578,21 +881,23 @@ class SimulationNode(Node):
           - Forklift origin is therefore (FORK_LENGTH - PALLET_LENGTH/2)
             metres behind the pallet centre, along pallet -X.
         """
-        pp = self.pallet_pose
+        pp = self.est_pallet_pose
         pallet_yaw = 2.0 * math.atan2(pp['qz'], pp['qw'])
 
         fork_tip_reach = self.FORK_LENGTH
         offset         = fork_tip_reach - self.PALLET_LENGTH / 2.0 + 0.10  # 150 mm short of full insertion
 
-        x = pp['x'] - offset * math.cos(pallet_yaw)
-        y = pp['y'] - offset * math.sin(pallet_yaw)
+        # Pallet +X faces forklift: forklift is on the +X side, heading in pallet -X direction
+        th = pallet_yaw + math.pi
+        x = pp['x'] + offset * math.cos(pallet_yaw)
+        y = pp['y'] + offset * math.sin(pallet_yaw)
 
         return {
             'x':  x,
             'y':  y,
-            'th': pallet_yaw,
-            'qz': math.sin(pallet_yaw / 2.0),
-            'qw': math.cos(pallet_yaw / 2.0),
+            'th': th,
+            'qz': math.sin(th / 2.0),
+            'qw': math.cos(th / 2.0),
         }
 
     def _compute_approach_pose(self):

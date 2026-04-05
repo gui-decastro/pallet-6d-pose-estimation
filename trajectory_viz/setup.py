@@ -30,6 +30,7 @@ setup(
     entry_points={
         'console_scripts': [
             'simulation_node = trajectory_viz.simulation_node:main',
+            'animation_control = trajectory_viz.animation_control:main',
         ],
     },
 )

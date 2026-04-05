@@ -34,29 +34,38 @@ ros2 launch trajectory_viz viz.launch.py
 
 ## Animating the Forklift
 
-The forklift starts stationary at the origin. Trigger animation from a second terminal using one of two modes.
+The forklift starts stationary at the origin. There are two ways to control the animation.
 
-### Mode 1 — Run Once
+### Option A — Keyboard controller (manual)
 
-The forklift moves through the full trajectory and stops at the pickup pose. Publish again to replay from the start.
+Launch the animation controller in a second terminal:
 
 ```bash
-ros2 topic pub --once /animation/run_once std_msgs/msg/Empty '{}'
+source install/setup.bash
+ros2 run trajectory_viz animation_control
 ```
 
-### Mode 2 — Continuous Loop
+| Key | Action |
+|-----|--------|
+| `r` | Run once — move through the trajectory and stop at the pickup pose. Press again to replay. |
+| `l` | Continuous loop — replay the trajectory indefinitely. |
+| `q` / Ctrl-C | Quit. |
 
-The forklift moves through the trajectory and immediately restarts from the origin, repeating indefinitely.
+### Option B — ROS topic (manual or from pipeline)
+
+Publish directly to the animation topics from any terminal or ROS2 node:
 
 ```bash
+# Run once
+ros2 topic pub --once /animation/run_once std_msgs/msg/Empty '{}'
+
+# Continuous loop
 ros2 topic pub --once /animation/loop std_msgs/msg/Empty '{}'
 ```
 
-You can switch modes at any time, including mid-animation. Publishing `/animation/loop` while in run-once mode (or vice versa) takes effect on the next restart.
+Both topics accept `std_msgs/msg/Empty`, so the pipeline can trigger animation without any changes to this package.
 
-### Triggering from the Pipeline
-
-Both topics accept `std_msgs/msg/Empty`, so any ROS2 node in the pipeline can trigger animation by publishing to `/animation/run_once` or `/animation/loop` — no changes to this package needed.
+You can switch modes at any time, including mid-animation.
 
 ## Planner Selection
 

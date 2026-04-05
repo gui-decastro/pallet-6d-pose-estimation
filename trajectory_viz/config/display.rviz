@@ -18,23 +18,37 @@ Preferences:
 Visualization Manager:
   Class: ""
   Displays:
-    - Alpha: 0.4
+    - Alpha: 0.15
       Cell Size: 1
       Class: rviz_default_plugins/Grid
-      Color: 160; 160; 164
+      Color: 100; 100; 100
       Enabled: true
       Line Style:
-        Line Width: 0.03
+        Line Width: 0.02
         Value: Lines
       Name: Grid
       Normal Cell Count: 0
       Offset:
         X: 0
         Y: 0
-        Z: 0
+        Z: 0.002
       Plane: XY
-      Plane Cell Count: 20
+      Plane Cell Count: 30
       Reference Frame: <Fixed Frame>
+      Value: true
+
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: WarehouseFloor
+      Namespaces:
+        floor: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /warehouse_floor
       Value: true
 
     - Class: rviz_default_plugins/MarkerArray
@@ -68,7 +82,7 @@ Visualization Manager:
         Y: 0
         Z: 0.05
       Pose Color: 100; 200; 255
-      Pose Style: Arrows
+      Pose Style: None
       Radius: 0.03
       Shaft Diameter: 0.05
       Shaft Length: 0.15
@@ -79,6 +93,48 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /trajectory
+      Value: true
+
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: FovLines
+      Namespaces:
+        fov: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /fov_lines
+      Value: true
+
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: PalletEstimated
+      Namespaces:
+        pallet_est: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /pallet_estimated
+      Value: true
+
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: PalletGroundTruth
+      Namespaces:
+        pallet_gt: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /pallet_ground_truth
       Value: true
 
     - Class: rviz_default_plugins/TF
@@ -103,7 +159,7 @@ Visualization Manager:
 
   Enabled: true
   Global Options:
-    Background Color: 40; 40; 40
+    Background Color: 25; 27; 30
     Fixed Frame: world
     Frame Rate: 30
   Name: root
