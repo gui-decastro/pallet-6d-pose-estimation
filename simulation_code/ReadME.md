@@ -39,11 +39,11 @@ RGB + EXR Depth
 
 ```
 .
-├── main.py               # Orchestrator — runs the full pipeline
-├── sim_depth_crop.py     # Step 1: YOLO + EXR depth unprojection
-├── cam_to_world.py       # Step 2: Camera → world frame transform
-├── floor_remove.py       # Step 3: RANSAC floor plane removal
-├── register.py           # Step 4: Constrained yaw-ICP registration
+├── sim_main.py                   # Orchestrator — runs the full pipeline
+├── sim_depth_crop.py             # Step 1: YOLO + EXR depth unprojection
+├── cam_to_world.py               # Step 2: Camera → world frame transform
+├── floor_remove.py               # Step 3: RANSAC floor plane removal
+├── register_new_constraint.py    # Step 4: Constrained yaw-ICP registration
 └── README.md
 ```
 
@@ -77,7 +77,7 @@ pip install ultralytics opencv-python openexr imath open3d numpy
 ## Usage
 
 ```bash
-python main.py \
+python sim_main.py \
   --rgb             /path/to/frame_rgb.png \
   --depth_exr       /path/to/frame_depth.exr \
   --cam_to_world_txt /path/to/T_world_cam.txt \
