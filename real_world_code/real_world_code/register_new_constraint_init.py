@@ -1,9 +1,10 @@
 import numpy as np
 import random
 import open3d as o3d
+from pathlib import Path
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-MESH_PATH = "Pallet_world_dim_transforms.ply"
+MESH_PATH = str(Path(__file__).parent.parent / "pallet_mesh" / "Pallet_world_dim_transforms.ply")
 
 BASE_SEED  = 7
 NUM_TRIALS = 10
@@ -550,3 +551,5 @@ def run(world_cloud_xyz: str):
     print(f"  y   : {pallet_y:.4f} m")
     print(f"  z   : {pallet_z:.4f} m")
     print(f"  yaw : {pallet_yaw:.4f}°  (rotation about Z axis)")
+
+    return pallet_x, pallet_y, float(yaw_final)

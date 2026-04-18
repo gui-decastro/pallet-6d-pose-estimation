@@ -38,32 +38,45 @@ struct OptimalParams {
     float depth_max = 6.0f;            // 6.0 meters (typical pallet range)
 };
 
-// Creates a directory, ignoring "already exists" errors
+// Creates a directory and all missing parent directories.
 static void make_dir(const std::string& path) {
-    int result = _mkdir(path.c_str());
-    if (result != 0 && errno != EEXIST) {
-        std::cerr << "[ERROR] Could not create directory: " << path
-                  << " (errno=" << errno << ")\n";
+    // Walk each prefix and create any missing component.
+    for (size_t pos = 0; pos != std::string::npos; ) {
+        pos = path.find_first_of("\\/", pos + 1);
+        std::string sub = path.substr(0, pos);
+        if (sub.empty()) continue;
+        int result = _mkdir(sub.c_str());
+        if (result != 0 && errno != EEXIST) {
+            std::cerr << "[ERROR] Could not create directory: " << sub
+                      << " (errno=" << errno << ")\n";
+            return;
+        }
     }
 }
 
-// Creates a timestamped session folder under the project's collected_data directory.
-// Always saves to an absolute path regardless of where the .exe is run from.
-std::string create_session_folder() {
-    const std::string output_root =
-        "C:\\Users\\guibc\\Robotics Projects\\Pallet 6D Pose Estimation\\collected_data";
+// Creates a timestamped session folder.
+// If output_root is non-empty, uses it directly as the session directory.
+// Otherwise falls back to the default timestamped path under collected_data.
+std::string create_session_folder(const std::string& output_root = "") {
+    if (!output_root.empty()) {
+        make_dir(output_root);
+        return output_root;
+    }
+
+    const std::string default_root =
+        "C:\\Users\\guibc\\Robotics Projects\\pallet-6d-pose-estimation\\camera_capture\\collected_data";
 
     std::time_t now = std::time(nullptr);
     std::tm t{};
     localtime_s(&t, &now);
 
     std::ostringstream oss;
-    oss << output_root << "\\session_"
+    oss << default_root << "\\session_"
         << std::put_time(&t, "%Y-%m-%d_%H-%M-%S");
 
     std::string session_path = oss.str();
 
-    make_dir(output_root);
+    make_dir(default_root);
     make_dir(session_path);
 
     return session_path;
@@ -157,16 +170,17 @@ void save_frame_data(const std::string& session_dir,
     std::cout << "  [OK] " << base << "_intrinsics.json (camera parameters)\n";
 }
 
-int main() try {
+int main(int argc, char* argv[]) try {
     std::cout << "\n";
     std::cout << "========================================================================\n";
     std::cout << "     D400e Pallet Detection - Production Capture\n";
     std::cout << "========================================================================\n";
-    
+
     OptimalParams params;
 
-    // Create timestamped session folder for this run
-    std::string session_dir = create_session_folder();
+    // Use argv[1] as output folder if provided; otherwise use default timestamped path
+    std::string output_root = (argc > 1) ? std::string(argv[1]) : "";
+    std::string session_dir = create_session_folder(output_root);
     std::cout << "\n[SESSION] Output folder: " << session_dir << "\n";
 
     // Find camera

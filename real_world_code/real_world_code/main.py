@@ -23,9 +23,10 @@ import real_world_depth_clean
 import floor_remove
 import clean_before_icp
 import register_new_constraint_init
+import publish_to_viz
 
 # ── User-editable config ──────────────────────────────────────────────────────
-WEIGHTS_PATH = "/home/sarthak_m/Capstone/runs/train_phase_1_3_4/weights/best.pt"
+WEIGHTS_PATH = r"C:\Users\guibc\Robotics Projects\pallet-6d-pose-estimation\real_world_code\models\yolo.pt"
 
 YOLO_DEVICE  = 0
 YOLO_IMGSZ   = 640
@@ -132,13 +133,23 @@ def main():
     print("\n" + "="*60)
     print("STEP 6 — Constrained yaw-ICP registration")
     print("="*60)
-    register_new_constraint_init.run(
+    pose = register_new_constraint_init.run(
         world_cloud_xyz=p["icp_input"],
     )
 
     print("\n" + "="*60)
     print("Pipeline complete.")
     print("="*60)
+
+    # ── Step 7: Push pose to trajectory_viz simulation (RViz2) ───────────────
+    if pose is not None:
+        pallet_x, pallet_y, pallet_yaw_rad = pose
+        print("\n" + "="*60)
+        print("STEP 7 — Publishing pose to trajectory_viz (RViz2)")
+        print("="*60)
+        publish_to_viz.publish_pose(pallet_x, pallet_y, pallet_yaw_rad)
+    else:
+        print("\n[INFO] ICP returned no result — skipping RViz2 update.")
 
 
 if __name__ == "__main__":

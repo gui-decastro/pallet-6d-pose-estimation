@@ -1,0 +1,17 @@
+# Core pipeline dependencies
+matplotlib
+numpy==2.2.4
+opencv-python==4.11.0.86
+open3d
+ultralytics
+pyrealsense2==2.56.5.9235
+
+# PyTorch — install with CUDA support (CUDA 12.0 compatible):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# For CPU-only:
+#   pip install torch torchvision
+torch
+torchvision
+
+# Simulation pipeline only
+# OpenEXR  (install separately if needed: pip install openexr)

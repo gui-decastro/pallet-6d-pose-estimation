@@ -1,3 +1,7 @@
+# Python virtual environment
+venv/
+.venv/
+
 # CMake build output
 camera_capture/d400e_cpp/build/
 
