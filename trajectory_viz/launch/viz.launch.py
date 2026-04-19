@@ -15,12 +15,15 @@ def generate_launch_description():
     wrapper = os.path.join(pkg_share, 'scripts', 'snap_clean_exec.sh')
     rviz2_bin = os.path.join(get_package_prefix('rviz2'), 'lib', 'rviz2', 'rviz2')
 
+    params_file = os.path.join(pkg_share, 'config', 'pallet_poses.yaml')
+
     return LaunchDescription([
         Node(
             package='trajectory_viz',
             executable='simulation_node',
             name='simulation_node',
             output='screen',
+            parameters=[params_file],
         ),
         ExecuteProcess(
             cmd=['bash', wrapper, rviz2_bin, '-d', rviz_config],

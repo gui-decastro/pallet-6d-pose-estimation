@@ -529,17 +529,25 @@ def run(world_cloud_xyz: str):
     print(f"[sanity] Top-surface Z delta     : {dz:.4f} m  "
           f"({'✓ good' if abs(dz) < 0.02 else '⚠ check Z alignment'})")
 
+    # Build a visualization callable so the caller can show it after publishing
     if VISUALIZE_BEST:
-        set_seed(best["seed"])
-        src_full = mesh.sample_points_poisson_disk(number_of_points=N_MESH_POINTS)
-        src_full.paint_uniform_color([1, 0, 0])
-        tgt_vis  = tgt_down
-        tgt_vis.paint_uniform_color([0, 1, 0])
-        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
-        src_full.transform(T_final)
-        o3d.visualization.draw_geometries(
-            [tgt_vis, src_full, frame],
-            window_name="ICP result — red=CAD  green=scan")
+        _seed    = best["seed"]
+        _T_final = T_final.copy()
+        _tgt_down = tgt_down
+
+        def viz_fn():
+            set_seed(_seed)
+            src_full = mesh.sample_points_poisson_disk(number_of_points=N_MESH_POINTS)
+            src_full.paint_uniform_color([1, 0, 0])
+            tgt_vis  = _tgt_down
+            tgt_vis.paint_uniform_color([0, 1, 0])
+            frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
+            src_full.transform(_T_final)
+            o3d.visualization.draw_geometries(
+                [tgt_vis, src_full, frame],
+                window_name="ICP result — red=CAD  green=scan")
+    else:
+        viz_fn = None
 
     pallet_x   = t_final[0]
     pallet_y   = t_final[1]
@@ -552,4 +560,4 @@ def run(world_cloud_xyz: str):
     print(f"  z   : {pallet_z:.4f} m")
     print(f"  yaw : {pallet_yaw:.4f}°  (rotation about Z axis)")
 
-    return pallet_x, pallet_y, float(yaw_final)
+    return pallet_x, pallet_y, float(yaw_final), viz_fn

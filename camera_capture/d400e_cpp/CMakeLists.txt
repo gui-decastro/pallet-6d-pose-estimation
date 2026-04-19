@@ -5,24 +5,17 @@ project(D400e_Capture)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# OpenCV path - defaults to C:/opencv. Override with: cmake .. -DOpenCV_DIR="path/to/opencv/build/x64/vcXX/lib"
-set(OpenCV_DIR "C:/opencv/build/x64/vc16/lib" CACHE PATH "Path to OpenCV cmake config directory")
 find_package(OpenCV REQUIRED)
+find_package(realsense2 REQUIRED)
 
-# RealSense paths (adjust if needed)
-set(REALSENSE_INCLUDE "C:/Program Files/FRAMOS/librealsense2/include")
-set(REALSENSE_LIB "C:/Program Files/FRAMOS/librealsense2/lib/realsense2.lib")
-
-# Include directories
-include_directories(${REALSENSE_INCLUDE})
 include_directories(${OpenCV_INCLUDE_DIRS})
 
 # Add executable
 add_executable(capture_d400e capture_d400e.cpp)
 
 # Link libraries
-target_link_libraries(capture_d400e 
-    ${REALSENSE_LIB}
+target_link_libraries(capture_d400e
+    realsense2::realsense2
     ${OpenCV_LIBS}
 )
 

@@ -1,6 +1,6 @@
 # Pallet Pose Estimation Pipeline
 
-End-to-end pipeline that takes a single RGB image + depth map, detects a pallet using YOLO, and estimates its 6-DoF pose (x, y, z, yaw) in the world frame via constrained ICP registration against a CAD mesh.
+End-to-end pipeline that takes a single RGB image + depth map, detects a pallet using YOLO, and estimates its 6-DoF pose (x, y, z, yaw) in the world frame via constrained ICP registration against a CAD mesh. The estimated pose is published to a RViz2 simulation that animates a forklift approach trajectory.
 
 ---
 
@@ -28,48 +28,87 @@ RGB + Depth (.bin) + Intrinsics (.json)
   6. register_new_constraint_init  PCA yaw init → constrained yaw-ICP → pallet pose
            │
            ▼
-  T_world_mesh_chosen_yaw_xyz.txt     (4×4 transform)
-  pallet_mesh_in_world_chosen_yaw_xyz.ply  (transformed mesh)
+  publish_to_viz  →  /est_pallet_pose_in  →  RViz2 trajectory animation
 ```
 
 ---
 
-## File Structure
+## Setup
 
-All scripts must be in the same directory:
-
-```
-pipeline/
-├── main.py
-├── real_world_depth_crop.py
-├── cam_to_world.py
-├── real_world_depth_clean.py
-├── floor_remove.py
-├── clean_before_icp.py
-├── register_new_constraint_init.py
-└── Pallet_world_dim_transforms.ply     ← CAD mesh (required by step 6)
-```
-
----
-
-## Dependencies
+### Virtual environment
 
 ```bash
-pip install numpy opencv-python ultralytics open3d
+python3 -m venv ~/repositories/pallet-6d-pose-estimation/venv
+source ~/repositories/pallet-6d-pose-estimation/venv/bin/activate
+
+# PyTorch (CPU — GTX 1050 Ti not supported by recent CUDA wheels)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# Rest of dependencies
+pip install matplotlib "numpy==2.2.4" "opencv-python==4.11.0.86" open3d ultralytics
 ```
 
-A CUDA-capable GPU is recommended for YOLO inference. CPU fallback works but is slower.
+### Make scripts executable (one-time)
+
+```bash
+chmod +x run_pipeline.sh
+```
+
+---
+
+## Usage
+
+All commands are run from the **repo root**.
+
+### Option A — Existing captured files (testing)
+
+```bash
+./run_pipeline.sh \
+  --rgb        /path/to/frame_rgb.png \
+  --depth_bin  /path/to/frame_depth_meters.bin \
+  --intrinsics /path/to/frame_intrinsics.json \
+  --out_dir    /path/to/output_folder \
+  --pick       farthest
+```
+
+RViz2 opens immediately. Once the pipeline finishes, the estimated pose is published and the forklift animation triggers automatically.
+
+### Option B — Live camera (demo mode)
+
+```bash
+./run_pipeline.sh --live
+```
+
+RViz2 and a live camera preview window open. Press `Space` to capture a frame and run the full pipeline. Press `Q` to quit.
+
+---
+
+## Demo setup (with ground truth comparison)
+
+Use two terminals.
+
+**Terminal 1** — start everything:
+```bash
+./run_pipeline.sh --live
+```
+
+**Terminal 2** — once the pallet is in its known position, publish the ground truth pose:
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/repositories/pallet-6d-pose-estimation/trajectory_viz/install/setup.bash
+python3 real_world_code/real_world_code/set_ground_truth.py --x 2.0 --y 0.1 --yaw_deg 5.0
+```
+
+The ground truth pallet appears in RViz immediately. Then press `Space` in the camera preview to run the pipeline — the estimated pose publishes and the forklift trajectory animates.
 
 ---
 
 ## Configuration
 
-Before running, open `main.py` and update the constants at the top:
+Open `real_world_code/real_world_code/main.py` and adjust if needed:
 
 ```python
-WEIGHTS_PATH = "/path/to/your/yolo/best.pt"   # YOLO model weights
-
-YOLO_DEVICE  = 0      # GPU device index (0, 1, …) or 'cpu'
+YOLO_DEVICE  = 'cpu'  # or GPU index if supported
 YOLO_IMGSZ   = 640    # YOLO input image size
 YOLO_CONF    = 0.01   # YOLO confidence threshold
 Z_MIN        = 0.5    # Min depth to keep (metres)
@@ -77,22 +116,11 @@ Z_MAX        = 4.0    # Max depth to keep (metres)
 DEPTH_STRIDE = 2      # Depth unprojection stride (1 = full res, 2 = half, …)
 ```
 
-Also ensure `Pallet_world_dim_transforms.ply` is present in the same directory as `main.py`, or update `MESH_PATH` in `register_new_constraint_init.py`.
+`WEIGHTS_PATH` is resolved automatically from `models/yolo.pt` relative to the script.
 
 ---
 
-## Usage
-
-```bash
-python main.py \
-  --rgb        /path/to/rgb.png \
-  --depth_bin  /path/to/depth_meters.bin \
-  --intrinsics /path/to/intrinsics.json \
-  --out_dir    /path/to/output_folder \
-  --pick       farthest
-```
-
-### Arguments
+## Arguments
 
 | Argument | Required | Description |
 |---|---|---|
@@ -123,13 +151,11 @@ python main.py \
 }
 ```
 
-The `model` value does not need to be quoted in the file — the parser handles this automatically.
-
 ---
 
 ## Output files
 
-All intermediate files are written to `--out_dir`. Final registration outputs are written to the **current working directory** (wherever you run `main.py` from).
+Intermediate files go to `--out_dir`. In demo mode they go to `demo_output/pipeline_out/`.
 
 | File | Description |
 |---|---|
@@ -141,45 +167,6 @@ All intermediate files are written to `--out_dir`. Final registration outputs ar
 | `<out_dir>/crop_world_cleaned_floor_removed_cleaned.xyz` | Final ICP input (largest cluster) |
 | `T_world_mesh_chosen_yaw_xyz.txt` | 4×4 world-to-mesh transform matrix |
 | `pallet_mesh_in_world_chosen_yaw_xyz.ply` | CAD mesh transformed into world frame |
-
-The final pallet pose (x, y, z, yaw) is printed to stdout at the end of the run.
-
----
-
-## Example
-
-```bash
-python main.py \
-  --rgb        /data/session_001/frame_0023_rgb.png \
-  --depth_bin  /data/session_001/frame_0023_depth_meters.bin \
-  --intrinsics /data/session_001/frame_0023_intrinsics.json \
-  --out_dir    /data/session_001/output \
-  --pick       farthest
-```
-
-Expected terminal output (abbreviated):
-
-```
-============================================================
-STEP 1 — Depth crop (YOLO + unprojection)
-============================================================
-BBox xyxy: (312, 204, 891, 617)  conf: 0.847  cls: 0
-Saved points: 48320 -> /data/session_001/output/crop.xyz
-
-============================================================
-STEP 2 — Camera frame → world frame
-============================================================
-[transform] camera frame → world frame
-[save]      48320 points saved to .../crop_world.xyz
-
-...
-
-=== PALLET POSE IN WORLD FRAME ===
-  x   : 0.1234 m
-  y   : -0.0512 m
-  z   : 0.0021 m
-  yaw : -12.4871°  (rotation about Z axis)
-```
 
 ---
 
@@ -197,5 +184,5 @@ Increase `DBSCAN_EPS` in `clean_before_icp.py` (e.g. `0.03` → `0.05`).
 **ICP fails — all trials report low fitness**
 Increase `ICP_DIST` or `YAW_SCORE_DIST` in `register_new_constraint_init.py`. Also verify the camera-to-world transform parameters in `cam_to_world.py` match your physical setup.
 
-**Open3D visualizer windows block the pipeline**
-Set `VISUALIZE_BEST = False` in `register_new_constraint_init.py` to skip the interactive 3D viewer.
+**Ground truth pose not appearing in RViz**
+Ensure the simulation node is running before calling `set_ground_truth.py`. The script waits up to 2 seconds for a subscriber — if it times out, the message is dropped.

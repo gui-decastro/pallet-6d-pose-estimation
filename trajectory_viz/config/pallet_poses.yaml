@@ -1,0 +1,11 @@
+simulation_node:
+  ros__parameters:
+    # Estimated pallet pose (camera/fork-face frame)
+    est_pallet_x:       1.95   # meters in front of camera
+    est_pallet_y:       0.1    # meters lateral from camera
+    est_pallet_yaw_deg: 12.0   # degrees
+
+    # Ground truth pallet pose
+    gt_pallet_x:        1.5
+    gt_pallet_y:        0.866
+    gt_pallet_yaw_deg:  30.0

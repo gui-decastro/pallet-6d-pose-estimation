@@ -11,7 +11,8 @@
 #include <algorithm>
 #include <ctime>
 #include <sstream>
-#include <direct.h>    // _mkdir on Windows
+#include <sys/stat.h>  // mkdir on Linux
+#include <sys/types.h>
 #include <errno.h>     // EEXIST
 
 // OPTIMAL PARAMETERS FOR PALLET DETECTION + ICP
@@ -45,7 +46,7 @@ static void make_dir(const std::string& path) {
         pos = path.find_first_of("\\/", pos + 1);
         std::string sub = path.substr(0, pos);
         if (sub.empty()) continue;
-        int result = _mkdir(sub.c_str());
+        int result = mkdir(sub.c_str(), 0755);
         if (result != 0 && errno != EEXIST) {
             std::cerr << "[ERROR] Could not create directory: " << sub
                       << " (errno=" << errno << ")\n";
@@ -64,14 +65,14 @@ std::string create_session_folder(const std::string& output_root = "") {
     }
 
     const std::string default_root =
-        "C:\\Users\\guibc\\Robotics Projects\\pallet-6d-pose-estimation\\camera_capture\\collected_data";
+        "/home/gdecastro/repositories/pallet-6d-pose-estimation/camera_capture/collected_data";
 
     std::time_t now = std::time(nullptr);
     std::tm t{};
-    localtime_s(&t, &now);
+    localtime_r(&now, &t);
 
     std::ostringstream oss;
-    oss << default_root << "\\session_"
+    oss << default_root << "/session_"
         << std::put_time(&t, "%Y-%m-%d_%H-%M-%S");
 
     std::string session_path = oss.str();
@@ -126,7 +127,7 @@ void save_frame_data(const std::string& session_dir,
 
     // Build base path: captures/session_YYYY-MM-DD_HH-MM-SS/frame_0042
     std::ostringstream oss;
-    oss << session_dir << "\\frame_" << std::setw(4) << std::setfill('0') << frame_index;
+    oss << session_dir << "/frame_" << std::setw(4) << std::setfill('0') << frame_index;
     std::string base = oss.str();
 
     // Save RGB

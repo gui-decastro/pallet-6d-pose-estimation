@@ -1,10 +1,11 @@
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped, Pose2D, Point
 from std_msgs.msg import Empty
 from nav_msgs.msg import Path
 from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import TransformBroadcaster
+from rcl_interfaces.msg import SetParametersResult
 import bisect
 import math
 
@@ -71,6 +72,77 @@ def plan_diff_drive_path(x0, y0, th0, x1, y1, th1,
 
 
 # ======================================================================
+#  Arc-blend diff-drive planner
+#
+#  A real differential-drive vehicle can rotate and translate at the same
+#  time.  This planner blends heading correction into forward motion using
+#  a cubic Bezier curve whose tangents match the start and end headings:
+#
+#    • If the heading deviation is within a blend threshold (~50°), a
+#      single Bezier arc handles the whole path smoothly.
+#    • If the deviation is larger, a short in-place spin brings the
+#      heading within the threshold first, then the Bezier takes over.
+#      This avoids backward loops while still minimising spin time.
+#
+#  The final heading th1 is enforced exactly at the endpoint, so the
+#  forklift always arrives aligned with the pallet axis.
+# ======================================================================
+
+def plan_arc_blend_path(x0, y0, th0, x1, y1, th1,
+                        step=0.10, rot_step_deg=5.0):
+    """Cubic-Bezier arc-blend path for a differential-drive vehicle."""
+    rot_step = math.radians(rot_step_deg)
+
+    dx, dy = x1 - x0, y1 - y0
+    dist   = math.hypot(dx, dy)
+    th_drive = math.atan2(dy, dx)
+
+    # Fall back to classical spin-drive-spin for very short moves
+    if dist < 0.25:
+        return plan_diff_drive_path(x0, y0, th0, x1, y1, th1,
+                                    step, rot_step_deg)
+
+    BLEND_THRESHOLD = math.radians(50)
+    d0 = _angle_diff(th_drive, th0)
+
+    points = []
+    xs, ys, ths = x0, y0, th0   # effective start after optional pre-spin
+
+    # Optional pre-spin: rotate to within blend threshold of travel heading
+    if abs(d0) > BLEND_THRESHOLD:
+        target_th = th_drive - math.copysign(BLEND_THRESHOLD * 0.8, d0)
+        delta = _angle_diff(target_th, th0)
+        n = max(2, int(abs(delta) / rot_step))
+        for i in range(n):
+            points.append((x0, y0, th0 + (i / n) * delta))
+        ths = target_th
+
+    # Cubic Bezier: tangents are ths at start and th1 at end
+    handle = dist * 0.28          # keep short — long handles cause S-curves on large heading changes
+    p0b = (xs, ys)
+    p1b = (xs + handle * math.cos(ths), ys + handle * math.sin(ths))
+    p2b = (x1 - handle * math.cos(th1), y1 - handle * math.sin(th1))
+    p3b = (x1, y1)
+
+    n = max(10, int(dist / step))
+    prev_x, prev_y, prev_th = xs, ys, ths
+    for i in range(n + 1):
+        u  = i / n
+        iv = 1.0 - u
+        bx = iv**3*p0b[0] + 3*iv**2*u*p1b[0] + 3*iv*u**2*p2b[0] + u**3*p3b[0]
+        by = iv**3*p0b[1] + 3*iv**2*u*p1b[1] + 3*iv*u**2*p2b[1] + u**3*p3b[1]
+
+        ddx, ddy = bx - prev_x, by - prev_y
+        th = math.atan2(ddy, ddx) if (abs(ddx) > 1e-8 or abs(ddy) > 1e-8) else prev_th
+        if i == n:
+            th = th1          # enforce exact final heading
+        points.append((bx, by, th))
+        prev_x, prev_y, prev_th = bx, by, th
+
+    return points
+
+
+# ======================================================================
 #  Dubins path planner (car-like, constant minimum turn radius)
 #
 #  Geometry conventions:
@@ -125,8 +197,8 @@ def plan_dubins_path(x0, y0, th0, x1, y1, th1,
     Plan a Dubins path for a car-like vehicle and return
     a list of (x, y, theta) world-frame waypoints.
 
-    min_radius — minimum turning radius (metres)
-    step       — sample spacing along the path (metres)
+    min_radius — minimum turning radius (meters)
+    step       — sample spacing along the path (meters)
     """
     r = min_radius
 
@@ -234,17 +306,21 @@ def plan_dubins_path(x0, y0, th0, x1, y1, th1,
 class SimulationNode(Node):
 
     # ---- Planner selection -------------------------------------------
+    # 'arc_blend'  — cubic Bezier blending rotation into forward motion (recommended)
     # 'diff_drive' — rotate in place → straight → rotate in place (supports reverse)
     # 'dubins'     — car-like path with minimum turn radius (DUBINS_RADIUS, forward only)
-    PLANNER       = 'diff_drive'
-    DUBINS_RADIUS = 1.0    # metres; minimum turning radius for Dubins planner
-    APPROACH_DIST = 1.0    # metres; forklift stops here behind pallet entry before final insertion
+    PLANNER       = 'arc_blend'
+    DUBINS_RADIUS = 0.0    # meters; minimum turning radius for Dubins planner
+    APPROACH_DIST  = 1.0   # meters; forklift stops here behind pallet entry before final insertion
+    APPROACH_PAUSE = 1.5   # seconds; dwell at approach pose before insertion
 
     # ---- Animation speed limits ------------------------------------
-    ANIM_LINEAR_SPEED  = 0.2   # m/s   — cruising speed (~3 km/h, typical loaded forklift)
-    ANIM_ANGULAR_SPEED = 0.25  # rad/s — in-place turn (~14°/s, heavy vehicle)
+    ANIM_LINEAR_SPEED  = 0.8   # m/s   — top speed on straight sections
+    ANIM_MAX_ACCEL     = 0.25  # m/s²  — acceleration and deceleration limit
+    ANIM_MAX_TURN_RATE = 0.30  # rad/s — max heading-change rate while driving
+    ANIM_ANGULAR_SPEED = 0.20  # rad/s — in-place rotation speed
 
-    # ---- Forklift geometry (metres) ----------------------------------
+    # ---- Forklift geometry (meters) ----------------------------------
     BODY_LENGTH    = 2.830   # CAT DP70: Z extent in STL (forward/length)
     BODY_WIDTH     = 1.230   # X extent in STL (width)
     BODY_HEIGHT    = 1.711   # Y extent in STL (up/height)
@@ -253,37 +329,42 @@ class SimulationNode(Node):
     FORK_THICKNESS = 0.07
     FORK_Y_OFFSET  = 0.369   # lateral distance from centre to each fork (from pallet mesh)
     # CAMERA_X_OFFSET = 0.610 # distance from forklift origin (front axle) to fork face (mast face)
-    CAMERA_X_OFFSET = 0.335 # distance from forklift origin (front axle) to fork face (mast face)
+    CAMERA_X_OFFSET  = 0.335  # distance from forklift origin (front axle) to fork face (mast face)
+    CAMERA_Z_HEIGHT  = 1.0    # camera height above ground (meters)
+    CAMERA_PITCH     = math.radians(45)   # pitch down angle (positive = looking down)
 
-    # ---- Pallet dimensions (metres) ----------------------------------
+    # FRAMOS D400e (Intel RealSense D455) depth FOV
+    CAMERA_FOV_H     = math.radians(87.0)   # horizontal full FOV
+    CAMERA_FOV_V     = math.radians(58.0)   # vertical full FOV
+    FRUSTUM_RANGE    = 3.0                  # how far to draw the frustum (meters)
+
+    # ---- Pallet dimensions (meters) ----------------------------------
     # Frame origin: centre of the TOP surface.
     PALLET_LENGTH  = 0.762    # x — fork-entry depth  (30")
     PALLET_WIDTH   = 0.8128   # y                     (32")
     PALLET_HEIGHT  = 0.12065  # z                     (4.75")
 
-    # ---- Manual pallet poses (edit here for testing) -----------------
-    # X and Y are in the CAMERA frame (fork face), not the forklift origin.
-    # e.g. EST_PALLET_X = 2.0 means 2 m in front of the camera.
-    # In production these are overridden by incoming ROS PoseStamped msgs
-    # on /est_pallet_pose_in and /gt_pallet_pose_in (same camera-frame convention).
-    EST_PALLET_X   = 2.0             # metres in front of camera (fork face)
-    EST_PALLET_Y   = 0.1             # metres lateral from camera
-    EST_PALLET_YAW = math.radians(16.0)  # heading (radians)
-
-    GT_PALLET_X    = 2.0
-    GT_PALLET_Y    = 0.0
-    GT_PALLET_YAW  = math.radians(15.0)
-
-
     def __init__(self):
         super().__init__('simulation_node')
+
+        # ---- Pallet poses (overridable via config/pallet_poses.yaml) --------
+        # X/Y are in the CAMERA frame (fork face). Yaw in degrees for readability.
+        # In production these are overridden by /est_pallet_pose_in and /gt_pallet_pose_in.
+        self.declare_parameter('est_pallet_x',       1.95)
+        self.declare_parameter('est_pallet_y',        0.1)
+        self.declare_parameter('est_pallet_yaw_deg', 12.0)
+        self.declare_parameter('gt_pallet_x',         2.0)
+        self.declare_parameter('gt_pallet_y',         0.0)
+        self.declare_parameter('gt_pallet_yaw_deg',  11.0)
+        self.add_on_set_parameters_callback(self._on_pallet_pose_params)
 
         self.marker_pub          = self.create_publisher(MarkerArray, '/visualization_markers',   10)
         self.floor_pub           = self.create_publisher(MarkerArray, '/warehouse_floor',         10)
         self.est_pallet_pub      = self.create_publisher(MarkerArray, '/pallet_estimated',        10)
         self.gt_pallet_pub       = self.create_publisher(MarkerArray, '/pallet_ground_truth',     10)
         self.approach_marker_pub = self.create_publisher(MarkerArray, '/approach_marker',         10)
-        self.fov_pub             = self.create_publisher(MarkerArray, '/fov_lines',               10)
+        self.tape_rays_pub       = self.create_publisher(MarkerArray, '/tape_rays',               10)
+        self.frustum_pub         = self.create_publisher(MarkerArray, '/camera_frustum',          10)
         self.path_pub          = self.create_publisher(Path, '/trajectory', 10)
         self.forklift_pose_pub = self.create_publisher(PoseStamped, '/forklift_pose', 10)
         self.est_pallet_pose_pub   = self.create_publisher(PoseStamped, '/est_pallet_pose', 10)
@@ -294,10 +375,14 @@ class SimulationNode(Node):
             'x': -self.CAMERA_X_OFFSET, 'y': 0.0, 'z': 0.0,
             'qx': 0.0, 'qy': 0.0, 'qz': 0.0, 'qw': 1.0,
         }
-        self.est_pallet_pose       = self._pose_from_xyyaw(
-            self.EST_PALLET_X, self.EST_PALLET_Y, self.EST_PALLET_YAW)
+        self.est_pallet_pose = self._pose_from_xyyaw(
+            self.get_parameter('est_pallet_x').value,
+            self.get_parameter('est_pallet_y').value,
+            math.radians(self.get_parameter('est_pallet_yaw_deg').value))
         self.ground_truth_pallet_pose = self._pose_from_xyyaw(
-            self.GT_PALLET_X,  self.GT_PALLET_Y,  self.GT_PALLET_YAW)
+            self.get_parameter('gt_pallet_x').value,
+            self.get_parameter('gt_pallet_y').value,
+            math.radians(self.get_parameter('gt_pallet_yaw_deg').value))
 
 
         # Pose the forklift must reach for forks to be fully inserted
@@ -305,13 +390,16 @@ class SimulationNode(Node):
         # Approach pose: APPROACH_DIST behind pickup, already aligned with pallet
         self.approach_pose = self._compute_approach_pose()
 
+        self._approach_waypoint_idx = 0
         self._path_waypoints  = self._build_path_waypoints()
         self._waypoint_times  = self._build_waypoint_times()
-        self._phase_times     = self._build_phase_times()
+
         self._anim_time  = self._waypoint_times[-1]  # stopped until triggered
         self._loop_mode  = False
+        self._est_pose_received = False  # hide estimated pose + trajectory until pipeline sends one
 
-        self.create_subscription(PoseStamped, '/est_pallet_pose_in', self._on_est_pallet_pose, 10)
+        self.create_subscription(PoseStamped, '/est_pallet_pose_in',    self._on_est_pallet_pose,    10)
+        self.create_subscription(Pose2D,      '/est_pallet_pose_2d',    self._on_est_pallet_pose_2d, 10)
         self.create_subscription(PoseStamped, '/gt_pallet_pose_in',  self._on_gt_pallet_pose,  10)
         self.create_subscription(Empty, '/animation/run_once',  self._on_run_once,  10)
         self.create_subscription(Empty, '/animation/loop',      self._on_loop,      10)
@@ -332,6 +420,37 @@ class SimulationNode(Node):
     #  Pallet pose helpers                                                 #
     # ------------------------------------------------------------------ #
 
+    def _on_pallet_pose_params(self, params):
+        """React to runtime `ros2 param set` changes for pallet pose parameters."""
+        EST_PARAMS = {'est_pallet_x', 'est_pallet_y', 'est_pallet_yaw_deg'}
+        GT_PARAMS  = {'gt_pallet_x',  'gt_pallet_y',  'gt_pallet_yaw_deg'}
+        changed = {p.name: p.value for p in params if p.name in EST_PARAMS | GT_PARAMS}
+        if not changed:
+            return SetParametersResult(successful=True)
+
+        def _get(name):
+            return changed[name] if name in changed else self.get_parameter(name).value
+
+        if changed.keys() & EST_PARAMS:
+            self.est_pallet_pose = self._pose_from_xyyaw(
+                _get('est_pallet_x'),
+                _get('est_pallet_y'),
+                math.radians(_get('est_pallet_yaw_deg')))
+            self._est_pose_received = True
+            self.pickup_pose     = self._compute_pickup_pose()
+            self.approach_pose   = self._compute_approach_pose()
+            self._path_waypoints = self._build_path_waypoints()
+            self._waypoint_times = self._build_waypoint_times()
+            self._anim_time      = self._waypoint_times[-1]  # reset to stopped
+
+        if changed.keys() & GT_PARAMS:
+            self.ground_truth_pallet_pose = self._pose_from_xyyaw(
+                _get('gt_pallet_x'),
+                _get('gt_pallet_y'),
+                math.radians(_get('gt_pallet_yaw_deg')))
+
+        return SetParametersResult(successful=True)
+
     def _pose_from_xyyaw(self, x, y, yaw):
         """x, y are in the camera (fork face) frame; world origin IS the camera."""
         yaw_gt = yaw + math.pi  # +X faces forklift convention
@@ -345,14 +464,26 @@ class SimulationNode(Node):
     def _on_est_pallet_pose(self, msg):
         q = msg.pose.orientation
         yaw = 2.0 * math.atan2(q.z, q.w)
-        self.est_pallet_pose  = self._pose_from_xyyaw(
+        self.est_pallet_pose = self._pose_from_xyyaw(
             msg.pose.position.x, msg.pose.position.y, yaw)
+        self._est_pose_received = True
         # Recompute trajectory to new estimated pallet pose
         self.pickup_pose     = self._compute_pickup_pose()
         self.approach_pose   = self._compute_approach_pose()
         self._path_waypoints = self._build_path_waypoints()
         self._waypoint_times = self._build_waypoint_times()
-        self._phase_times    = self._build_phase_times()
+        self.get_logger().info('Estimated pallet pose received — trajectory ready.')
+
+
+    def _on_est_pallet_pose_2d(self, msg):
+        """Accept x, y (metres) and theta (degrees) — matches the manual constant format."""
+        self.est_pallet_pose = self._pose_from_xyyaw(msg.x, msg.y, math.radians(msg.theta))
+        self._est_pose_received = True
+        self.pickup_pose     = self._compute_pickup_pose()
+        self.approach_pose   = self._compute_approach_pose()
+        self._path_waypoints = self._build_path_waypoints()
+        self._waypoint_times = self._build_waypoint_times()
+        self.get_logger().info('Estimated pallet pose received — trajectory ready.')
 
     def _on_gt_pallet_pose(self, msg):
         q = msg.pose.orientation
@@ -413,10 +544,12 @@ class SimulationNode(Node):
         self._publish_transforms(now)
         self._publish_markers(now)
         self._publish_poses(now)
-        self._publish_trajectory(now)
-        self._publish_approach_marker(now)
+        if self._est_pose_received:
+            self._publish_trajectory(now)
+            self._publish_approach_marker(now)
         self._publish_floor(now)
-        self._publish_fov_lines(now)
+        self._publish_tape_rays(now)
+        self._publish_camera_frustum(now)
 
     # ------------------------------------------------------------------ #
     #  Velocity profile                                                    #
@@ -424,67 +557,67 @@ class SimulationNode(Node):
 
     def _build_waypoint_times(self):
         """
-        Assign a wall-clock timestamp to each waypoint based on geometry:
-          - Translation steps use ANIM_LINEAR_SPEED.
-          - Rotation-in-place steps (x,y unchanged) use ANIM_ANGULAR_SPEED.
+        Trapezoidal velocity profile along the path arc length.
+
+        For each waypoint, compute the maximum allowable speed based on the
+        local curvature (v_max = ANIM_MAX_TURN_RATE / curvature).  Then run a
+        forward pass (acceleration limit) and a backward pass (deceleration
+        limit) to produce a physically smooth, continuous speed profile.
+        Time for each segment is derived from the average speed at its two
+        endpoints, so acceleration and deceleration are natural outputs of the
+        physics rather than a post-process smoothing hack.
         """
-        times = [0.0]
-        for i in range(1, len(self._path_waypoints)):
-            x0, y0, th0 = self._path_waypoints[i - 1]
-            x1, y1, th1 = self._path_waypoints[i]
-            dist = math.hypot(x1 - x0, y1 - y0)
-            dth  = abs(_angle_diff(th1, th0))
+        pts = self._path_waypoints
+        n   = len(pts)
+
+        # Per-segment arc length and heading change
+        segs = []
+        for i in range(1, n):
+            x0, y0, th0 = pts[i - 1]
+            x1, y1, th1 = pts[i]
+            segs.append((math.hypot(x1 - x0, y1 - y0),
+                         abs(_angle_diff(th1, th0))))
+
+        # Max speed at each waypoint node from curvature constraint
+        v_max = [self.ANIM_LINEAR_SPEED] * n
+        v_max[0]  = 0.0   # start from rest
+        v_max[-1] = 0.0   # end at rest
+        idx = self._approach_waypoint_idx
+        if 0 < idx < n:
+            v_max[idx] = 0.0  # full stop at approach pose before insertion
+        for i, (dist, dth) in enumerate(segs):
+            if dist > 1e-4 and dth > 1e-4:
+                v_curve = self.ANIM_MAX_TURN_RATE / (dth / dist)
+                v_max[i]     = min(v_max[i],     v_curve)
+                v_max[i + 1] = min(v_max[i + 1], v_curve)
+
+        # Forward pass — acceleration limit
+        v = list(v_max)
+        for i in range(1, n):
+            dist = segs[i - 1][0]
             if dist > 1e-4:
-                dt = dist / self.ANIM_LINEAR_SPEED
+                v[i] = min(v[i], math.sqrt(max(0.0, v[i-1]**2 + 2*self.ANIM_MAX_ACCEL*dist)))
+
+        # Backward pass — deceleration limit
+        for i in range(n - 2, -1, -1):
+            dist = segs[i][0]
+            if dist > 1e-4:
+                v[i] = min(v[i], math.sqrt(max(0.0, v[i+1]**2 + 2*self.ANIM_MAX_ACCEL*dist)))
+
+        # Assign timestamps from average speed on each segment,
+        # injecting APPROACH_PAUSE at the approach waypoint
+        times = [0.0]
+        for i, (dist, dth) in enumerate(segs):
+            if dist > 1e-4:
+                v_avg = (v[i] + v[i + 1]) / 2.0
+                dt = dist / max(v_avg, 1e-3)
             else:
                 dt = dth / self.ANIM_ANGULAR_SPEED if dth > 1e-4 else 0.0
             times.append(times[-1] + max(dt, 1e-4))
+            # Insert dwell after the forklift reaches the approach pose
+            if i + 1 == self._approach_waypoint_idx:
+                times[-1] += self.APPROACH_PAUSE
         return times
-
-    def _build_phase_times(self):
-        """
-        Group consecutive waypoints into contiguous phases (rotation or translation)
-        and return the (t_start, t_end) time range for each phase.
-        Smoothstep is later applied across each phase as a whole so that the
-        forklift ramps up/down over the full duration of each movement.
-        """
-        pts   = self._path_waypoints
-        times = self._waypoint_times
-        if len(pts) < 2:
-            return [(0.0, times[-1])]
-
-        def _is_translation(i):
-            x0, y0, _ = pts[i]
-            x1, y1, _ = pts[i + 1]
-            return math.hypot(x1 - x0, y1 - y0) > 1e-4
-
-        phases = []
-        phase_start = 0
-        current = _is_translation(0)
-        for i in range(1, len(pts) - 1):
-            seg_type = _is_translation(i)
-            if seg_type != current:
-                phases.append((times[phase_start], times[i]))
-                phase_start = i
-                current = seg_type
-        phases.append((times[phase_start], times[-1]))
-        return phases
-
-    def _apply_phase_smoothstep(self, t):
-        """
-        Map raw animation time t through a per-phase quintic smootherstep.
-        Each phase (rotation or translation) gets its own ease-in/ease-out so
-        the forklift accelerates and decelerates smoothly within every segment.
-        """
-        for (t_start, t_end) in self._phase_times:
-            if t <= t_end:
-                duration = t_end - t_start
-                if duration < 1e-6:
-                    return t
-                u = (t - t_start) / duration
-                u = u * u * u * (u * (u * 6.0 - 15.0) + 10.0)  # quintic smootherstep
-                return t_start + u * duration
-        return t
 
     def _interpolate_pose(self, t):
         """Return (x, y, theta) at time t by linear interpolation between waypoints."""
@@ -494,7 +627,6 @@ class SimulationNode(Node):
             return pts[0]
         if t >= times[-1]:
             return pts[-1]
-        t = self._apply_phase_smoothstep(t)
         i = bisect.bisect_right(times, t) - 1
         i = max(0, min(i, len(pts) - 2))
         t0, t1 = times[i], times[i + 1]
@@ -514,9 +646,10 @@ class SimulationNode(Node):
     def _publish_transforms(self, now):
         transforms = []
 
-        for child, pose in [('forklift',  self.forklift_pose),
-                             ('pallet_est', self.est_pallet_pose),
-                             ('pallet_gt', self.ground_truth_pallet_pose)]:
+        frames = [('forklift', self.forklift_pose), ('pallet_gt', self.ground_truth_pallet_pose)]
+        if self._est_pose_received:
+            frames.append(('pallet_est', self.est_pallet_pose))
+        for child, pose in frames:
             tf = TransformStamped()
             tf.header.stamp    = now
             tf.header.frame_id = 'world'
@@ -530,18 +663,19 @@ class SimulationNode(Node):
             tf.transform.rotation.w = pose['qw']
             transforms.append(tf)
 
-        # 'pickup' frame — where the forklift must be to lift the pallet
-        pp = self.pickup_pose
-        tf = TransformStamped()
-        tf.header.stamp    = now
-        tf.header.frame_id = 'world'
-        tf.child_frame_id  = 'pickup'
-        tf.transform.translation.x = pp['x']
-        tf.transform.translation.y = pp['y']
-        tf.transform.translation.z = 0.0
-        tf.transform.rotation.z = pp['qz']
-        tf.transform.rotation.w = pp['qw']
-        transforms.append(tf)
+        # 'pickup' frame — only meaningful once estimated pose is known
+        if self._est_pose_received:
+            pp = self.pickup_pose
+            tf = TransformStamped()
+            tf.header.stamp    = now
+            tf.header.frame_id = 'world'
+            tf.child_frame_id  = 'pickup'
+            tf.transform.translation.x = pp['x']
+            tf.transform.translation.y = pp['y']
+            tf.transform.translation.z = 0.0
+            tf.transform.rotation.z = pp['qz']
+            tf.transform.rotation.w = pp['qw']
+            transforms.append(tf)
 
         self.tf_broadcaster.sendTransform(transforms)
 
@@ -554,9 +688,10 @@ class SimulationNode(Node):
         markers.markers += self._forklift_markers(now, frame='forklift', id_base=0, alpha=1.00)
         self.marker_pub.publish(markers)
 
-        est = MarkerArray()
-        est.markers += self._pallet_markers(now)
-        self.est_pallet_pub.publish(est)
+        if self._est_pose_received:
+            est = MarkerArray()
+            est.markers += self._pallet_markers(now)
+            self.est_pallet_pub.publish(est)
 
         gt = MarkerArray()
         gt.markers += self._ground_truth_pallet_markers(now)
@@ -614,7 +749,7 @@ class SimulationNode(Node):
 
     # --- Pallet ------------------------------------------------------- #
 
-    # pallet.stl: exported from FreeCAD in metres; Z is up (matches ROS convention).
+    # pallet.stl: exported from FreeCAD in meters; Z is up (matches ROS convention).
     #   Bounding box: X=[0, 0.762], Y=[0.019, 0.832], Z=[0, 0.121]
     #   Origin is at a corner on the ground — not centred.
     #   Scale = PALLET_DIM[m] / _STL_RANGE[m] ≈ 1.0 on all axes.
@@ -777,10 +912,13 @@ class SimulationNode(Node):
         return markers
 
     # ------------------------------------------------------------------ #
-    #  FOV lines                                                           #
+    #  30-degree reference tape rays (physical tape on warehouse floor)   #
     # ------------------------------------------------------------------ #
 
-    def _publish_fov_lines(self, now):
+    def _publish_tape_rays(self, now):
+        """Three tape strips on the floor: centre ray and ±30° rays.
+        These represent physical tape placed in the real environment to
+        mark ground-truth image capture positions — not the camera FOV."""
         length     = 3.0
         tape_width = 0.05
         tape_thick = 0.002   # essentially flush with z=0
@@ -791,7 +929,7 @@ class SimulationNode(Node):
             m = Marker()
             m.header.stamp    = now
             m.header.frame_id = 'world'
-            m.ns              = 'fov'
+            m.ns              = 'tape_rays'
             m.id              = mid
             m.type            = Marker.CUBE
             m.action          = Marker.ADD
@@ -808,7 +946,122 @@ class SimulationNode(Node):
             m.color.r, m.color.g, m.color.b, m.color.a = 0.1, 0.35, 0.9, 1.0
             markers.append(m)
 
-        self.fov_pub.publish(MarkerArray(markers=markers))
+        self.tape_rays_pub.publish(MarkerArray(markers=markers))
+
+    # ------------------------------------------------------------------ #
+    #  Camera frustum (FRAMOS D400e / RealSense D455, 87° H × 58° V)     #
+    # ------------------------------------------------------------------ #
+
+    def _publish_camera_frustum(self, now):
+        """Draws the D455 depth camera frustum in the forklift TF frame.
+
+        The camera is at (CAMERA_X_OFFSET, 0, CAMERA_Z_HEIGHT) in the
+        forklift frame, pitched down by CAMERA_PITCH (positive = nose down).
+        Rotation R_y(+pitch): x'=x·cosθ+z·sinθ, z'=-x·sinθ+z·cosθ.
+        For positive θ the +X forward vector gains -Z (downward). ✓
+
+        Each corner ray is clipped at z=0 so nothing is drawn below the floor.
+        The fill quad is the camera's footprint on the ground plane.
+
+        Two markers are published:
+          id=0  LINE_LIST     — wireframe edges of the frustum pyramid
+          id=1  TRIANGLE_LIST — semi-opaque ground footprint (what the camera sees)
+        """
+        half_h = self.CAMERA_FOV_H / 2.0
+        half_v = self.CAMERA_FOV_V / 2.0
+        r      = self.FRUSTUM_RANGE
+        pitch  = self.CAMERA_PITCH
+
+        # Camera apex in forklift frame
+        ax, ay, az = self.CAMERA_X_OFFSET, 0.0, self.CAMERA_Z_HEIGHT
+
+        # Half-extents of the far rectangle in camera space (camera looks +X)
+        fy = r * math.tan(half_h)
+        fz = r * math.tan(half_v)
+
+        # Helper: apply R_y(+pitch) then translate to forklift frame
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        def _fk(x, y, z):
+            return Point(
+                x=ax + x * cp + z * sp,
+                y=ay + y,
+                z=az - x * sp + z * cp,
+            )
+
+        apex = _fk(0.0, 0.0, 0.0)
+        corners = [
+            _fk(r,  fy,  fz),   # top-left
+            _fk(r, -fy,  fz),   # top-right
+            _fk(r, -fy, -fz),   # bottom-right
+            _fk(r,  fy, -fz),   # bottom-left
+        ]
+
+        # Clip a ray from apex to pt at z=0 (floor) for the wireframe.
+        # If pt is already above the floor it is returned unchanged;
+        # otherwise the floor intersection is returned so nothing is drawn below ground.
+        def _clip(pt):
+            if pt.z >= 0.0:
+                return pt
+            dz = pt.z - apex.z   # always negative when pt is below floor
+            t  = -apex.z / dz
+            return Point(x=apex.x + t * (pt.x - apex.x),
+                         y=apex.y + t * (pt.y - apex.y),
+                         z=0.0)
+
+        # Project a corner ray onto the floor (z=0) for the fill polygon.
+        # Extends the ray past the far plane if needed — the fill always lies flat on the ground.
+        # Returns None if the ray goes upward and never reaches the floor.
+        def _project_to_ground(pt):
+            dz = pt.z - apex.z
+            if dz >= 0.0:
+                return None  # ray goes up — no ground intersection
+            t = -apex.z / dz
+            return Point(x=apex.x + t * (pt.x - apex.x),
+                         y=apex.y + t * (pt.y - apex.y),
+                         z=0.0)
+
+        clipped = [_clip(c) for c in corners]
+        ground  = [_project_to_ground(c) for c in corners]
+
+        # --- Wireframe: 4 apex→clipped-corner rays + 4 far-rectangle edges ---
+        wire_pts = []
+        for c in clipped:
+            wire_pts += [apex, c]
+        for i in range(4):
+            wire_pts += [clipped[i], clipped[(i + 1) % 4]]
+
+        m_wire = Marker()
+        m_wire.header.stamp    = now
+        m_wire.header.frame_id = 'forklift'
+        m_wire.ns              = 'camera_frustum'
+        m_wire.id              = 0
+        m_wire.type            = Marker.LINE_LIST
+        m_wire.action          = Marker.ADD
+        m_wire.pose.orientation.w = 1.0
+        m_wire.scale.x         = 0.02
+        m_wire.color.r, m_wire.color.g, m_wire.color.b, m_wire.color.a = 0.1, 0.9, 0.55, 1.0
+        m_wire.points          = wire_pts
+
+        # --- Ground footprint fill: project frustum rays onto z=0 ---
+        m_fill = Marker()
+        m_fill.header.stamp    = now
+        m_fill.header.frame_id = 'forklift'
+        m_fill.ns              = 'camera_frustum'
+        m_fill.id              = 1
+        m_fill.type            = Marker.TRIANGLE_LIST
+        m_fill.action          = Marker.ADD
+        m_fill.pose.orientation.w = 1.0
+        m_fill.scale.x = m_fill.scale.y = m_fill.scale.z = 1.0
+        m_fill.color.r, m_fill.color.g, m_fill.color.b, m_fill.color.a = 0.1, 0.9, 0.55, 0.35
+        if all(g is not None for g in ground):
+            m_fill.points = [
+                ground[0], ground[1], ground[2],
+                ground[0], ground[2], ground[3],
+                ground[2], ground[1], ground[0],
+                ground[3], ground[2], ground[0],
+            ]
+
+        self.frustum_pub.publish(MarkerArray(markers=[m_wire, m_fill]))
 
     def _base_marker(self, frame, marker_id, now, mtype):
         m = Marker()
@@ -879,7 +1132,7 @@ class SimulationNode(Node):
             in pallet frame) → full insertion.
           - fork_tip_reach = FORK_LENGTH from forklift origin (front axle).
           - Forklift origin is therefore (FORK_LENGTH - PALLET_LENGTH/2)
-            metres behind the pallet centre, along pallet -X.
+            meters behind the pallet centre, along pallet -X.
         """
         pp = self.est_pallet_pose
         pallet_yaw = 2.0 * math.atan2(pp['qz'], pp['qw'])
@@ -902,7 +1155,7 @@ class SimulationNode(Node):
 
     def _compute_approach_pose(self):
         """
-        Compute the approach pose: APPROACH_DIST metres behind the pickup pose
+        Compute the approach pose: APPROACH_DIST meters behind the pickup pose
         along the pallet entry axis. The forklift is already aligned with the
         pallet yaw here, so the final segment to pickup is a straight drive.
         """
@@ -933,7 +1186,13 @@ class SimulationNode(Node):
         ap  = self.approach_pose
         pp  = self.pickup_pose
 
-        if self.PLANNER == 'dubins':
+        if self.PLANNER == 'arc_blend':
+            seg1 = plan_arc_blend_path(
+                fp['x'], fp['y'], th0,
+                ap['x'], ap['y'], ap['th'],
+            )
+            label = 'Arc-blend'
+        elif self.PLANNER == 'dubins':
             seg1 = plan_dubins_path(
                 fp['x'], fp['y'], th0,
                 ap['x'], ap['y'], ap['th'],
@@ -957,6 +1216,7 @@ class SimulationNode(Node):
         ]
 
         waypoints = seg1 + seg2
+        self._approach_waypoint_idx = len(seg1)
         self.get_logger().info(
             f'{label} path: {len(seg1)} + {len(seg2)} waypoints '
             f'(approach + insertion)'

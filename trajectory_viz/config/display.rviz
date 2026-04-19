@@ -97,16 +97,30 @@ Visualization Manager:
 
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: FovLines
+      Name: TapeRays
       Namespaces:
-        fov: true
+        tape_rays: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /fov_lines
+        Value: /tape_rays
+      Value: true
+
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: CameraFrustum
+      Namespaces:
+        camera_frustum: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /camera_frustum
       Value: true
 
     - Class: rviz_default_plugins/MarkerArray
@@ -150,7 +164,7 @@ Visualization Manager:
           Value: true
       Marker Scale: 1.2
       Name: TF
-      Show Arrows: true
+      Show Arrows: false
       Show Axes: true
       Show Names: true
       Tree: {}

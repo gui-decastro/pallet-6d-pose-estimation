@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import threading
 from pathlib import Path
 
 # ── Pipeline imports ──────────────────────────────────────────────────────────
@@ -26,9 +27,9 @@ import register_new_constraint_init
 import publish_to_viz
 
 # ── User-editable config ──────────────────────────────────────────────────────
-WEIGHTS_PATH = r"C:\Users\guibc\Robotics Projects\pallet-6d-pose-estimation\real_world_code\models\yolo.pt"
+WEIGHTS_PATH = str(Path(__file__).parent.parent / "models" / "yolo.pt")
 
-YOLO_DEVICE  = 0
+YOLO_DEVICE  = 'cpu'
 YOLO_IMGSZ   = 640
 YOLO_CONF    = 0.01
 Z_MIN        = 0.5
@@ -133,7 +134,7 @@ def main():
     print("\n" + "="*60)
     print("STEP 6 — Constrained yaw-ICP registration")
     print("="*60)
-    pose = register_new_constraint_init.run(
+    result = register_new_constraint_init.run(
         world_cloud_xyz=p["icp_input"],
     )
 
@@ -142,14 +143,29 @@ def main():
     print("="*60)
 
     # ── Step 7: Push pose to trajectory_viz simulation (RViz2) ───────────────
-    if pose is not None:
-        pallet_x, pallet_y, pallet_yaw_rad = pose
+    if result is not None:
+        pallet_x, pallet_y, pallet_yaw_rad, viz_fn = result
         print("\n" + "="*60)
         print("STEP 7 — Publishing pose to trajectory_viz (RViz2)")
         print("="*60)
+
+        # Pallets are symmetric every 90° — normalize yaw to [-45°, 45°] so
+        # the forklift always approaches from the front, never the side.
+        import math
+        yaw_deg = math.degrees(pallet_yaw_rad)
+        yaw_deg_normalized = ((yaw_deg + 45) % 90) - 45
+        pallet_yaw_rad = math.radians(yaw_deg_normalized)
+        print(f"[yaw] raw={yaw_deg:.2f}°  normalized={yaw_deg_normalized:.2f}°")
+
         publish_to_viz.publish_pose(pallet_x, pallet_y, pallet_yaw_rad)
     else:
+        viz_fn = None
         print("\n[INFO] ICP returned no result — skipping RViz2 update.")
+
+    # ── Step 8: Show ICP visualizer in background (non-blocking) ─────────────
+    if viz_fn is not None:
+        print("\n[INFO] Opening ICP visualizer in background (close window when done).")
+        threading.Thread(target=viz_fn, daemon=False).start()
 
 
 if __name__ == "__main__":
