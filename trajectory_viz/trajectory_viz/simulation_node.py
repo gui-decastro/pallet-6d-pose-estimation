@@ -397,6 +397,7 @@ class SimulationNode(Node):
         self._anim_time  = self._waypoint_times[-1]  # stopped until triggered
         self._loop_mode  = False
         self._est_pose_received = False  # hide estimated pose + trajectory until pipeline sends one
+        self._gt_pose_received  = False  # hide ground truth pallet until set_ground_truth.py sends one
 
         self.create_subscription(PoseStamped, '/est_pallet_pose_in',    self._on_est_pallet_pose,    10)
         self.create_subscription(Pose2D,      '/est_pallet_pose_2d',    self._on_est_pallet_pose_2d, 10)
@@ -490,6 +491,7 @@ class SimulationNode(Node):
         yaw = 2.0 * math.atan2(q.z, q.w)
         self.ground_truth_pallet_pose = self._pose_from_xyyaw(
             msg.pose.position.x, msg.pose.position.y, yaw)
+        self._gt_pose_received = True
 
     def _reset_forklift(self):
         self.forklift_pose['x']  = -self.CAMERA_X_OFFSET
@@ -646,7 +648,9 @@ class SimulationNode(Node):
     def _publish_transforms(self, now):
         transforms = []
 
-        frames = [('forklift', self.forklift_pose), ('pallet_gt', self.ground_truth_pallet_pose)]
+        frames = [('forklift', self.forklift_pose)]
+        if self._gt_pose_received:
+            frames.append(('pallet_gt', self.ground_truth_pallet_pose))
         if self._est_pose_received:
             frames.append(('pallet_est', self.est_pallet_pose))
         for child, pose in frames:
@@ -693,9 +697,10 @@ class SimulationNode(Node):
             est.markers += self._pallet_markers(now)
             self.est_pallet_pub.publish(est)
 
-        gt = MarkerArray()
-        gt.markers += self._ground_truth_pallet_markers(now)
-        self.gt_pallet_pub.publish(gt)
+        if self._gt_pose_received:
+            gt = MarkerArray()
+            gt.markers += self._ground_truth_pallet_markers(now)
+            self.gt_pallet_pub.publish(gt)
 
     # --- Forklift STL constants --------------------------------------- #
     # forklift.stl (CAT DP70): exported from FreeCAD in mm.
