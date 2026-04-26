@@ -2,6 +2,7 @@ from pathlib import Path
 import numpy as np
 import cv2
 import re
+import time
 from ultralytics import YOLO
 
 
@@ -120,8 +121,10 @@ def run(
     cx = float(K["cx"])
     cy = float(K["cy"])
 
+    t0 = time.perf_counter()
     model = YOLO(weights_path)
     best = yolo_best_bbox_xyxy(model, rgb_path, imgsz=imgsz, conf=conf, device=device)
+    yolo_s = time.perf_counter() - t0
     if best is None:
         print("No detections on RGB. No .xyz created.")
         return None
@@ -129,10 +132,11 @@ def run(
     x1, y1, x2, y2, best_conf, cls_id = best
     bbox = (x1, y1, x2, y2)
 
+    t1 = time.perf_counter()
     depth_m = load_depth_bin(depth_bin_path, width=width, height=height, dtype=np.float32)
     pts = bbox_to_xyz(depth_m, bbox, fx, fy, cx, cy, z_min=z_min, z_max=z_max, stride=stride)
-
     save_xyz(pts, out_xyz_path)
+    depth_crop_s = time.perf_counter() - t1
 
     print("BBox xyxy:", bbox, "conf:", best_conf, "cls:", cls_id)
     print("Saved points:", pts.shape[0], "->", out_xyz_path)
@@ -141,4 +145,4 @@ def run(
         draw_bbox(rgb_path, bbox, out_debug_depth_vis_with_box,
                   label=f"cls={cls_id} conf={best_conf:.3f}")
 
-    return bbox, pts
+    return bbox, pts, yolo_s, depth_crop_s

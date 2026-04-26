@@ -12,10 +12,14 @@ started, open a second terminal and source ROS2 there):
 """
 
 import argparse
+import json
 import math
 import time
+from pathlib import Path
 
 import rclpy
+
+GT_POSE_FILE = Path(__file__).parent / ".gt_pose.json"
 from geometry_msgs.msg import PoseStamped
 
 
@@ -52,6 +56,8 @@ def main():
 
     node.destroy_node()
     rclpy.shutdown()
+
+    GT_POSE_FILE.write_text(json.dumps({"x": args.x, "y": args.y, "yaw_deg": args.yaw_deg}))
     print(f"Ground truth published: x={args.x} m  y={args.y} m  yaw={args.yaw_deg}°")
 
 

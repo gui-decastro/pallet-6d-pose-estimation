@@ -2,12 +2,13 @@ import numpy as np
 import random
 import open3d as o3d
 from pathlib import Path
+from scipy.spatial import KDTree
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 MESH_PATH = str(Path(__file__).parent.parent / "pallet_mesh" / "Pallet_world_dim_transforms.ply")
 
 BASE_SEED  = 7
-NUM_TRIALS = 10
+NUM_TRIALS = 1
 
 VOXEL_SIZE    = 0.02
 N_MESH_POINTS = 12000
@@ -147,35 +148,24 @@ def solve_yaw_and_translation(P, Q):
     return yaw, np.array([t_xy[0], t_xy[1], t_z], dtype=np.float64)
 
 
-def build_kdtree(target_points):
-    tgt_pcd = make_pcd(target_points)
-    return tgt_pcd, o3d.geometry.KDTreeFlann(tgt_pcd)
+def build_kdtree(target_points: np.ndarray) -> KDTree:
+    return KDTree(target_points)
 
 
-def find_correspondences(src_transformed, tgt_points, kdtree, max_dist):
-    inlier_src_idx = []
-    inlier_tgt_idx = []
-    inlier_dist    = []
-    max_dist2      = max_dist * max_dist
-
-    for i in range(src_transformed.shape[0]):
-        k, idx, dist2 = kdtree.search_knn_vector_3d(src_transformed[i], 1)
-        if k == 1 and dist2[0] <= max_dist2:
-            inlier_src_idx.append(i)
-            inlier_tgt_idx.append(idx[0])
-            inlier_dist.append(np.sqrt(dist2[0]))
-
-    if len(inlier_src_idx) == 0:
+def find_correspondences(src_transformed: np.ndarray, kdtree: KDTree, max_dist: float):
+    dists, idxs = kdtree.query(src_transformed, k=1, workers=-1)
+    mask = dists <= max_dist
+    if not np.any(mask):
         return None, None, None
+    src_idx = np.where(mask)[0].astype(np.int64)
+    tgt_idx = idxs[mask].astype(np.int64)
+    return src_idx, tgt_idx, dists[mask].astype(np.float64)
 
-    return (np.array(inlier_src_idx, dtype=np.int64),
-            np.array(inlier_tgt_idx, dtype=np.int64),
-            np.array(inlier_dist,    dtype=np.float64))
 
-
-def score_yaw_candidates(src_points_fixed, tgt_pcd_down, tgt_centroid, yaw_bias=None):
-    tgt_pts = np.asarray(tgt_pcd_down.points)
-    best    = {"yaw": None, "t": None, "fitness": -1.0, "rmse": 1e9}
+def score_yaw_candidates(src_points_fixed, tgt_down_pts, tgt_kdtree, tgt_centroid, yaw_bias=None):
+    best      = {"yaw": None, "t": None, "fitness": -1.0, "rmse": 1e9}
+    tgt_max_z = tgt_down_pts[:, 2].max()
+    n_src     = len(src_points_fixed)
 
     if yaw_bias is None:
         yaw_vals = [wrap_to_pi(np.deg2rad(y))
@@ -187,18 +177,16 @@ def score_yaw_candidates(src_points_fixed, tgt_pcd_down, tgt_centroid, yaw_bias=
                 yaw_vals.append(wrap_to_pi(center + np.deg2rad(off)))
 
     for yaw in yaw_vals:
-        Rz      = rot_z(yaw)
-        src_rot = (Rz @ src_points_fixed.T).T
-
+        src_rot      = (rot_z(yaw) @ src_points_fixed.T).T
         src_centroid = src_rot.mean(axis=0)
         t            = tgt_centroid - src_centroid
-        t[2]         = tgt_pts[:, 2].max() - src_rot[:, 2].max()
+        t[2]         = tgt_max_z - src_rot[:, 2].max()
+        src_try      = src_rot + t
 
-        src_try_pcd = make_pcd(src_rot + t)
-        d           = np.asarray(src_try_pcd.compute_point_cloud_distance(tgt_pcd_down))
-        inliers     = d < YAW_SCORE_DIST
-        fit         = float(np.sum(inliers)) / float(len(d)) if len(d) > 0 else 0.0
-        rmse        = float(np.sqrt(np.mean(d[inliers] ** 2))) if np.any(inliers) else 1e9
+        dists, _  = tgt_kdtree.query(src_try, k=1, workers=-1)
+        inliers   = dists < YAW_SCORE_DIST
+        fit       = float(np.sum(inliers)) / n_src
+        rmse      = float(np.sqrt(np.mean(dists[inliers] ** 2))) if np.any(inliers) else 1e9
 
         if (fit > best["fitness"] + 1e-9) or \
            (abs(fit - best["fitness"]) <= 1e-9 and rmse < best["rmse"]):
@@ -207,17 +195,15 @@ def score_yaw_candidates(src_points_fixed, tgt_pcd_down, tgt_centroid, yaw_bias=
     return best["yaw"], best["t"]
 
 
-def constrained_icp_yaw_xyz(src_points_fixed, tgt_points, init_yaw, init_t,
+def constrained_icp_yaw_xyz(src_points_fixed, tgt_points, tgt_kdtree, init_yaw, init_t,
                              min_inliers=50):
-    _, kdtree = build_kdtree(tgt_points)
     yaw       = float(init_yaw)
     t         = init_t.astype(np.float64).copy()
     converged = False
 
     for _ in range(ICP_MAX_ITERS):
-        src_trans            = (rot_z(yaw) @ src_points_fixed.T).T + t
-        src_idx, tgt_idx, _  = find_correspondences(
-            src_trans, tgt_points, kdtree, ICP_DIST)
+        src_trans           = (rot_z(yaw) @ src_points_fixed.T).T + t
+        src_idx, tgt_idx, _ = find_correspondences(src_trans, tgt_kdtree, ICP_DIST)
 
         if src_idx is None or len(src_idx) < min_inliers:
             return None, None, 0.0, 1e9
@@ -227,9 +213,9 @@ def constrained_icp_yaw_xyz(src_points_fixed, tgt_points, init_yaw, init_t,
         if new_yaw is None:
             return None, None, 0.0, 1e9
 
-        dyaw    = abs(wrap_to_pi(new_yaw - yaw))
-        dt      = np.linalg.norm(new_t - t)
-        yaw, t  = float(new_yaw), new_t
+        dyaw   = abs(wrap_to_pi(new_yaw - yaw))
+        dt     = np.linalg.norm(new_t - t)
+        yaw, t = float(new_yaw), new_t
 
         if dyaw < np.deg2rad(CONVERGE_YAW_DEG) and dt < CONVERGE_T:
             converged = True
@@ -239,9 +225,8 @@ def constrained_icp_yaw_xyz(src_points_fixed, tgt_points, init_yaw, init_t,
         print(f"    [ICP] WARNING: hit max iterations ({ICP_MAX_ITERS}) "
               "without converging")
 
-    src_trans            = (rot_z(yaw) @ src_points_fixed.T).T + t
-    src_idx, tgt_idx, d = find_correspondences(
-        src_trans, tgt_points, kdtree, ICP_DIST)
+    src_trans           = (rot_z(yaw) @ src_points_fixed.T).T + t
+    src_idx, tgt_idx, d = find_correspondences(src_trans, tgt_kdtree, ICP_DIST)
 
     if src_idx is None or len(src_idx) == 0:
         return None, None, 0.0, 1e9
@@ -251,12 +236,12 @@ def constrained_icp_yaw_xyz(src_points_fixed, tgt_points, init_yaw, init_t,
     return yaw, t, fitness, rmse
 
 
-def evaluate_symmetric_yaws(base_yaw, src_pts_fixed, tgt_down_pts, t_init):
+def evaluate_symmetric_yaws(base_yaw, src_pts_fixed, tgt_down_pts, tgt_kdtree, t_init):
     candidates = []
     for offset_deg in SYMMETRY_OFFSETS_DEG:
         yaw_try               = wrap_to_pi(base_yaw + np.deg2rad(offset_deg))
         yaw_out, t_out, fit, rmse = constrained_icp_yaw_xyz(
-            src_pts_fixed, tgt_down_pts, yaw_try, t_init)
+            src_pts_fixed, tgt_down_pts, tgt_kdtree, yaw_try, t_init)
 
         if yaw_out is not None:
             print(f"    offset={offset_deg:+4d}°  fit={fit:.4f}  rmse={rmse:.4f}  "
@@ -274,7 +259,7 @@ def evaluate_symmetric_yaws(base_yaw, src_pts_fixed, tgt_down_pts, t_init):
 
 
 def try_rotation_fix(yaw_best, t_best, fit_best, rmse_best,
-                     src_pts_fixed, tgt_down_pts):
+                     src_pts_fixed, tgt_down_pts, tgt_kdtree):
     print("\n[rot-fix] Trying current best rotated by ±90° ...")
     print(f"[rot-fix] current  fit={fit_best:.4f}  rmse={rmse_best:.4f}  "
           f"yaw={wrap_to_180(np.degrees(yaw_best)):.2f}°")
@@ -282,7 +267,7 @@ def try_rotation_fix(yaw_best, t_best, fit_best, rmse_best,
     for offset_deg in [-90, 90]:
         yaw_try              = wrap_to_pi(yaw_best + np.deg2rad(offset_deg))
         yaw_out, t_out, fit, rmse = constrained_icp_yaw_xyz(
-            src_pts_fixed, tgt_down_pts, yaw_try, t_best)
+            src_pts_fixed, tgt_down_pts, tgt_kdtree, yaw_try, t_best)
 
         if yaw_out is None:
             print(f"[rot-fix] offset={offset_deg:+d}°  FAILED (too few inliers)")
@@ -314,7 +299,7 @@ def is_better(curr_fit, curr_rmse, best_fit, best_rmse):
     return False
 
 
-def run(world_cloud_xyz: str):
+def run(world_cloud_xyz: str, out_dir: str = "."):
     roll    = np.deg2rad(ROLL_FIXED_DEG)
     pitch   = np.deg2rad(PITCH_FIXED_DEG)
     R_fixed = rot_y(pitch) @ rot_x(roll)
@@ -341,6 +326,11 @@ def run(world_cloud_xyz: str):
     tgt_centroid = tgt_down_pts.mean(axis=0)
     print(f"[centroid] Depth cloud centroid (x,y,z): {tgt_centroid}")
 
+    # Build the target KD-tree once — reused by score_yaw, all ICP calls,
+    # symmetry checks, rotation fix, and min-abs-yaw refinement.
+    tgt_kdtree = build_kdtree(tgt_down_pts)
+
+    # PCA yaw bias — computed once from a single sample (used only for init)
     set_seed(BASE_SEED)
     src_pca       = mesh.sample_points_poisson_disk(number_of_points=N_MESH_POINTS)
     src_pca_pts   = np.asarray(src_pca.points).astype(np.float64)
@@ -372,13 +362,13 @@ def run(world_cloud_xyz: str):
         src_down_pts_fixed = np.asarray(src_down.points).astype(np.float64)
 
         init_yaw, init_t = score_yaw_candidates(
-            src_down_pts_fixed, tgt_down, tgt_centroid, yaw_bias=yaw_bias)
+            src_down_pts_fixed, tgt_down_pts, tgt_kdtree, tgt_centroid, yaw_bias=yaw_bias)
         if init_yaw is None:
             print(f"[trial {i+1}/{NUM_TRIALS}] seed={seed}  FAILED init yaw")
             continue
 
         yaw, t, fit, rmse = constrained_icp_yaw_xyz(
-            src_down_pts_fixed, tgt_down_pts, init_yaw, init_t)
+            src_down_pts_fixed, tgt_down_pts, tgt_kdtree, init_yaw, init_t)
 
         yaw_deg = wrap_to_180(np.degrees(yaw)) if yaw is not None else None
         print(f"[trial {i+1}/{NUM_TRIALS}] seed={seed}  "
@@ -414,6 +404,7 @@ def run(world_cloud_xyz: str):
             best["yaw"],
             best["src_down_pts_fixed"],
             tgt_down_pts,
+            tgt_kdtree,
             best["t"],
         )
 
@@ -433,6 +424,7 @@ def run(world_cloud_xyz: str):
         yaw_final, t_final, fit_final, rmse_final,
         best["src_down_pts_fixed"],
         tgt_down_pts,
+        tgt_kdtree,
     )
 
     yaw_snapped = snap_to_180_symmetry(yaw_final, yaw_after_symmetry)
@@ -446,7 +438,7 @@ def run(world_cloud_xyz: str):
 
         yaw_out, t_out, fit_out, rmse_out = constrained_icp_yaw_xyz(
             best["src_down_pts_fixed"], tgt_down_pts,
-            yaw_snapped, t_final)
+            tgt_kdtree, yaw_snapped, t_final)
 
         if yaw_out is not None:
             yaw_final  = yaw_out
@@ -474,7 +466,7 @@ def run(world_cloud_xyz: str):
         yaw2_init_deg = wrap_to_180(np.degrees(yaw2_init))
 
         yaw2, t2, fit2, rmse2 = constrained_icp_yaw_xyz(
-            best["src_down_pts_fixed"], tgt_down_pts, yaw2_init, t1)
+            best["src_down_pts_fixed"], tgt_down_pts, tgt_kdtree, yaw2_init, t1)
 
         yaw2_deg = wrap_to_180(np.degrees(float(yaw2))) if yaw2 is not None else None
 
@@ -514,11 +506,11 @@ def run(world_cloud_xyz: str):
     print(f"[sanity] Translation magnitude: {np.linalg.norm(t_final):.4f} m")
     print("\nT_world_mesh_chosen:\n", T_final)
 
-    np.savetxt("T_world_mesh_chosen_yaw_xyz.txt", T_final)
+    np.savetxt(f"{out_dir}/T_world_mesh_chosen_yaw_xyz.txt", T_final)
 
     mesh_w = o3d.io.read_triangle_mesh(MESH_PATH)
     mesh_w.transform(T_final)
-    o3d.io.write_triangle_mesh("pallet_mesh_in_world_chosen_yaw_xyz.ply", mesh_w)
+    o3d.io.write_triangle_mesh(f"{out_dir}/pallet_mesh_in_world_chosen_yaw_xyz.ply", mesh_w)
 
     cad_pts_world = np.asarray(mesh_w.vertices)
     dz = cad_pts_world[:,2].max() - tgt_pts_full[:,2].max()
@@ -531,12 +523,11 @@ def run(world_cloud_xyz: str):
 
     # Build a visualization callable so the caller can show it after publishing
     if VISUALIZE_BEST:
-        _seed    = best["seed"]
-        _T_final = T_final.copy()
+        _T_final  = T_final.copy()
         _tgt_down = tgt_down
 
         def viz_fn():
-            set_seed(_seed)
+            set_seed(BASE_SEED)
             src_full = mesh.sample_points_poisson_disk(number_of_points=N_MESH_POINTS)
             src_full.paint_uniform_color([1, 0, 0])
             tgt_vis  = _tgt_down
